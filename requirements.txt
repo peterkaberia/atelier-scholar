@@ -1,0 +1,28 @@
+# --- Web & UI ---
+dash
+dash[diskcache]
+dash[celery]
+requests
+tenacity
+
+# --- Data Processing ---
+pandas
+numpy
+
+# --- Neural Retrieval (Sparse Encoders) ---
+sentence-transformers
+torch
+torchvision
+
+# --- LLM Orchestration ---
+langchain
+langchain-anthropic
+langchain-groq
+langchain-openai
+langchain_google_genai
+
+# --- Environment Management ---
+python-dotenv
+
+# --- Database ---
+peewee
