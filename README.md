@@ -2,6 +2,7 @@
 
 > An open-source, AI-powered academic research synthesizer and literature copilot.
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/damurka/atelier/blob/main/atelier-demo.ipynb)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)]()
 [![Dash](https://img.shields.io/badge/UI-Plotly_Dash-informational.svg)]()
