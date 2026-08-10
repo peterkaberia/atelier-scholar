@@ -10,6 +10,7 @@ throttling, retries, and unified JSON/Text fetching.
 from __future__ import annotations
 
 import logging
+import re
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, List, Optional
@@ -19,6 +20,7 @@ from core.utils import (
     clean_text,
     make_fingerprint,
     nested_get,
+    normalize_arxivid,
     normalize_doi,
     normalize_pmcid,
     normalize_pmid,
@@ -453,4 +455,148 @@ class SemanticScholarEngine(BasePaperEngine):
             doi=doi, pmid=pmid, pmcid=pmcid, pdf_url=clean_text(pdf_url), full_text_url=clean_text(full_text_url),
             citation_count=safe_int(item.get("citationCount")) or 0, raw=item
         )
+
+
+# ----------------------------
+# Crossref Engine
+# ----------------------------
+
+class CrossRefEngine(BasePaperEngine):
+    """
+    Search Crossref's public `works` API. The broadest DOI-metadata coverage
+    of any engine here - it spans virtually every publisher/discipline
+    rather than leaning biomedical (PubMed, Europe PMC) or CS/broad-web
+    (Semantic Scholar, OpenAlex), so it's a genuine recall complement rather
+    than an overlapping duplicate of the other three.
+    """
+    BASE_URL = "https://api.crossref.org/works"
+
+    def search(self, query: str, limit: int = 200) -> List[Record]:
+        logger.info(f"CrossRef: Searching for '{query[:50]}...'")
+        params = {
+            "query.bibliographic": query,
+            "rows": min(limit, 100),
+        }
+        payload = self._get_json(self.BASE_URL, params=params)
+        items = nested_get(payload, "message", "items") or []
+        return [self._normalize_item(item) for item in items if item.get("title")]
+
+    def _normalize_item(self, item: Dict[str, Any]) -> Record:
+        doi = normalize_doi(item.get("DOI"))
+        title_list = item.get("title") or []
+        title = clean_text(title_list[0]) if title_list else None
+
+        authors: List[str] = []
+        for a in item.get("author", []) or []:
+            given, family = a.get("given"), a.get("family")
+            name = " ".join(p for p in [given, family] if p)
+            if name:
+                authors.append(name)
+            elif a.get("name"):
+                authors.append(a["name"])
+
+        journal_list = item.get("container-title") or []
+        journal = clean_text(journal_list[0]) if journal_list else None
+
+        date_parts = nested_get(item, "published", "date-parts")
+        year = safe_int(date_parts[0][0]) if date_parts and date_parts[0] else None
+
+        pdf_url = None
+        for link in item.get("link", []) or []:
+            if "pdf" in (link.get("content-type") or "").lower():
+                pdf_url = link.get("URL")
+                break
+
+        # Crossref abstracts, when present, come wrapped in JATS XML tags
+        # (e.g. "<jats:p>...</jats:p>") - strip them down to plain text.
+        raw_abstract = item.get("abstract")
+        abstract = clean_text(re.sub(r"<[^>]+>", " ", raw_abstract)) if raw_abstract else None
+
+        fingerprint = make_fingerprint(
+            doi=doi, pmid=None, pmcid=None, arxiv_id=None,
+            fallback_source="crossref", fallback_id=doi or item.get("URL")
+        )
+
+        return Record(
+            source="crossref", source_id=clean_text(doi), fingerprint=fingerprint,
+            title=title or "", abstract=abstract, authors=authors, journal=journal, year=year,
+            doi=doi, pdf_url=clean_text(pdf_url), full_text_url=clean_text(item.get("URL")),
+            citation_count=safe_int(item.get("is-referenced-by-count")) or 0, raw=item
+        )
+
+
+# ----------------------------
+# arXiv Engine
+# ----------------------------
+
+class ArxivEngine(BasePaperEngine):
+    """
+    Search arXiv's public Atom feed API. Covers preprints (physics, CS,
+    math, quantitative biology, stats, etc.) that rarely if ever appear in
+    the biomedical-leaning or peer-review-only engines above - real recall
+    gain for anything computational or quantitative in a topic, at the cost
+    of results that haven't been peer-reviewed.
+    """
+    BASE_URL = "http://export.arxiv.org/api/query"
+    ATOM_NS = "{http://www.w3.org/2005/Atom}"
+    ARXIV_NS = "{http://arxiv.org/schema/2007}"
+
+    def search(self, query: str, limit: int = 200) -> List[Record]:
+        logger.info(f"arXiv: Searching for '{query[:50]}...'")
+        params = {
+            "search_query": f"all:{query}",
+            "max_results": min(limit, 100),
+            "sortBy": "relevance",
+        }
+        xml_text = self._get_text(self.BASE_URL, params=params)
+        return self._parse_feed(xml_text)
+
+    def _parse_feed(self, xml_text: str) -> List[Record]:
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as e:
+            logger.error(f"arXiv XML Parse Error: {e}")
+            return []
+
+        out: List[Record] = []
+        for entry in root.findall(f"{self.ATOM_NS}entry"):
+            title = clean_text((entry.findtext(f"{self.ATOM_NS}title") or "").replace("\n", " "))
+            if not title:
+                continue
+
+            raw_id = (entry.findtext(f"{self.ATOM_NS}id") or "").strip()
+            arxiv_id = normalize_arxivid(raw_id.rsplit("/", 1)[-1]) if raw_id else None
+            summary = clean_text((entry.findtext(f"{self.ATOM_NS}summary") or "").replace("\n", " "))
+            published = entry.findtext(f"{self.ATOM_NS}published") or ""
+            year = safe_int(published[:4]) if published else None
+
+            authors = [
+                clean_text(a.findtext(f"{self.ATOM_NS}name"))
+                for a in entry.findall(f"{self.ATOM_NS}author")
+            ]
+            authors = [a for a in authors if a]
+
+            doi = None
+            doi_el = entry.find(f"{self.ARXIV_NS}doi")
+            if doi_el is not None:
+                doi = normalize_doi(doi_el.text)
+
+            pdf_url = None
+            for link in entry.findall(f"{self.ATOM_NS}link"):
+                if link.attrib.get("title") == "pdf" or link.attrib.get("type") == "application/pdf":
+                    pdf_url = link.attrib.get("href")
+                    break
+
+            fingerprint = make_fingerprint(
+                doi=doi, pmid=None, pmcid=None, arxiv_id=arxiv_id,
+                fallback_source="arxiv", fallback_id=arxiv_id or raw_id
+            )
+
+            out.append(Record(
+                source="arxiv", source_id=arxiv_id or raw_id, fingerprint=fingerprint,
+                title=title, abstract=summary, authors=authors, journal="arXiv preprint",
+                year=year, doi=doi, pdf_url=pdf_url, full_text_url=raw_id or None,
+                citation_count=0, raw={}
+            ))
+        return out
 

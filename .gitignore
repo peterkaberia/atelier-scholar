@@ -5,6 +5,9 @@
 .env
 .env.local
 
+# Local encryption key for Settings-UI-entered API keys (see core/secrets.py)
+.atelier_secret.key
+
 # Ignore the local SQLite database (prevents committing user chat history and massive vector strings)
 *.db*
 *.sqlite3

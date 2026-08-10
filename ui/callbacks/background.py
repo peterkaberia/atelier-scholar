@@ -1,8 +1,10 @@
 from dash import CeleryManager, DiskcacheManager
 from core.config import REDIS_URL
+from llm.utils import _is_set
+
 
 def background_manager():
-    if REDIS_URL:
+    if _is_set(REDIS_URL):
         # Use Redis & Celery if REDIS_URL set as an env variable
         from celery import Celery
         celery_app = Celery(__name__, broker=REDIS_URL, backend=REDIS_URL)

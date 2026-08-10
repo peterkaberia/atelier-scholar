@@ -18,13 +18,22 @@ class HttpClient(ABC):
         self.session.headers.update({"User-Agent": USER_AGENT})
         self.timeout = timeout
 
-        # Configure robust retries so API hiccups don't crash the search
+        # Configure robust retries so API hiccups don't crash the search.
+        # backoff_factor=2 -> retries sleep ~2s, 4s, 8s, 16s (urllib3's
+        # formula: backoff_factor * 2**(retry_number-1)) when a host doesn't
+        # send a Retry-After header. Bumped from the original 3 retries/
+        # factor=1 (~1s,2s,4s) after repeated Semantic Scholar 429s during
+        # live testing - S2's unauthenticated tier shares one global rate
+        # pool across every anonymous caller, so a single 429 there often
+        # needs several seconds of backoff (not just one) before the shared
+        # window resets. respect_retry_after_header still takes priority
+        # over this formula whenever a host actually sends one.
         retries = Retry(
-            total=3, 
+            total=5,
             connect=3,
             read=3,
-            status=3,
-            backoff_factor=1, 
+            status=5,
+            backoff_factor=2,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=(["GET","HEAD"]),
             respect_retry_after_header=True

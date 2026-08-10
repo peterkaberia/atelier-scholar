@@ -5,16 +5,19 @@ from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
+from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
-from core.config import (
-    ANTHROPIC_API_KEY,
-    GOOGLE_API_KEY,
-    GROQ_API_KEY,
-    OPENAI_API_KEY
-)
+from core.config import resolve_key
+from llm.model_catalog import list_provider_models
 
 logger = logging.getLogger(__name__)
+
+# Default endpoints for locally-hosted providers, overridable via Settings.
+# Deliberately the 127.0.0.1 literal, not "localhost" - see model_catalog.py.
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_LMSTUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 class BufferedStreamingHandler(BaseCallbackHandler):
     """
@@ -48,58 +51,18 @@ _common_callbacks = [BufferedStreamingHandler()]
 # Define common parameters for most LLMs
 _common_llm_params = {"temperature": 0.0, "streaming": True, "callbacks": _common_callbacks}
 
-# Map input model choices (lowercased) to their configuration
-# Each config includes the class and any model-specific constructor parameters
-_llm_config_map = {
-    'gpt-4.1': {
-        'class': ChatOpenAI,
-        'constructor_params': {'model_name': 'gpt-4.1'} 
-    },
-    'gpt-5.2': {
-        'class': ChatOpenAI,
-        'constructor_params': {'model_name': 'gpt-5.2'} 
-    },
-    'gpt-5.1': {
-        'class': ChatOpenAI,
-        'constructor_params': {'model_name': 'gpt-5.1'} 
-    },
-    'gpt-5-mini': {
-        'class': ChatOpenAI,
-        'constructor_params': {'model_name': 'gpt-5-mini'} 
-    },
-    'gpt-5-nano': { 
-        'class': ChatOpenAI,
-        'constructor_params': {'model_name': 'gpt-5-nano'} 
-    },
-    'claude-sonnet-4-5': {
-        'class': ChatAnthropic,
-        'constructor_params': {'model': 'claude-sonnet-4-5'}
-    },
-    'claude-sonnet-4-0': {
-        'class': ChatAnthropic,
-        'constructor_params': {'model': 'claude-sonnet-4-0'}
-    },
-    'gemini-2.5-flash': {
-        'class': ChatGoogleGenerativeAI,
-        'constructor_params': {'model': 'gemini-2.5-flash', 'google_api_key': GOOGLE_API_KEY }
-    },
-    'gemini-2.5-flash-lite': {
-        'class': ChatGoogleGenerativeAI,
-        'constructor_params': {'model': 'gemini-2.5-flash-lite', 'google_api_key': GOOGLE_API_KEY}
-    },
-    'gemini-2.5-pro': {
-        'class': ChatGoogleGenerativeAI,
-        'constructor_params': {'model': 'gemini-2.5-pro', 'google_api_key': GOOGLE_API_KEY}
-    },
-    'gpt-oss-120b-groq': {
-        'class': ChatGroq,
-        'constructor_params': {'model_name': 'openai/gpt-oss-120b' }
-    },
-    'llama-3.3-70b-versatile': {
-        'class': ChatGroq,
-        'constructor_params': {'model_name': 'llama-3.3-70b-versatile' }
-    }
-}
+# Cloud providers: (provider prefix, LangChain class, Settings/.env key name).
+# No per-model entries here anymore - see resolve_model_config()/get_model_choices()
+# below, which list each provider's actual current models live instead of a
+# hardcoded, perpetually-stale table.
+_CLOUD_PROVIDERS = [
+    ("anthropic", ChatAnthropic, "ANTHROPIC_API_KEY"),
+    ("google", ChatGoogleGenerativeAI, "GOOGLE_API_KEY"),
+    ("groq", ChatGroq, "GROQ_API_KEY"),
+    ("openai", ChatOpenAI, "OPENAI_API_KEY"),
+]
+_CLOUD_PROVIDER_CLASSES = {name: cls for name, cls, _ in _CLOUD_PROVIDERS}
+_CLOUD_PROVIDER_KEYS = {name: env_key for name, _, env_key in _CLOUD_PROVIDERS}
 
 def _normalize_model_name(name: str) -> str:
     """Standardizes model names for reliable dictionary lookups."""
@@ -111,35 +74,96 @@ def _is_set(v: Optional[str]) -> bool:
 
 def get_model_choices() -> List[str]:
     """
-    Returns a list of model strings that the user is actually authorized to use,
-    based on which API keys are present in their .env file.
+    Returns "provider:model" choices for every provider that's currently
+    reachable - a live "list of set providers", not a hand-maintained one.
+
+    - Cloud providers (Anthropic/Google/Groq/OpenAI) are gated by a
+      configured key, then list THEIR OWN current models via that
+      provider's models API - a new model release shows up automatically,
+      no code change needed.
+    - Ollama/LM Studio are probed directly (fast local timeout); whatever
+      they report as loaded is listed, no manual model name needed.
+    - OpenRouter needs a configured key; its full model catalog is public
+      and listed the same way.
+
+    Re-checked (with short-lived caching in model_catalog.py) on every call,
+    so this reflects Settings changes without an app restart.
     """
-    gated_base_models: List[str] = []
+    choices: List[str] = []
 
-    anthropic_ok = _is_set(ANTHROPIC_API_KEY)
-    google_ok = _is_set(GOOGLE_API_KEY)
-    groq_ok = _is_set(GROQ_API_KEY)
-    openai_ok = _is_set(OPENAI_API_KEY)
+    for provider, _cls, env_key in _CLOUD_PROVIDERS:
+        api_key = resolve_key(env_key)
+        if _is_set(api_key):
+            choices += [f"{provider}:{m}" for m in list_provider_models(provider, api_key)]
 
-    for k, cfg in _llm_config_map.items():
-        cls = cfg.get('class')
+    # Local providers are opt-in, same as cloud ones: only probed once the
+    # user has explicitly configured them in Settings (even just re-saving
+    # the default URL) - never auto-detected/silently network-probed on
+    # every render for users who haven't set them up at all.
+    ollama_url = resolve_key("OLLAMA_BASE_URL")
+    if _is_set(ollama_url):
+        choices += [f"ollama:{m}" for m in list_provider_models("ollama", ollama_url)]
 
-        # Anthropic
-        if cls is ChatAnthropic and anthropic_ok:
-            gated_base_models.append(k)
-        elif cls is ChatGoogleGenerativeAI and google_ok:
-            gated_base_models.append(k)
-        elif cls is ChatGroq and groq_ok:
-            gated_base_models.append(k)
-        elif cls is ChatOpenAI and openai_ok:
-            gated_base_models.append(k)
+    lmstudio_url = resolve_key("LMSTUDIO_BASE_URL")
+    if _is_set(lmstudio_url):
+        choices += [f"lmstudio:{m}" for m in list_provider_models("lmstudio", lmstudio_url)]
 
-    return gated_base_models
+    openrouter_key = resolve_key("OPENROUTER_API_KEY")
+    if _is_set(openrouter_key):
+        choices += [f"openrouter:{m}" for m in list_provider_models("openrouter", openrouter_key)]
+
+    return choices
 
 def resolve_model_config(model_name: str):
     """
-    Takes a model string from the UI and returns its underlying LangChain class 
-    and constructor parameters.
+    Takes a "provider:model" string from the UI and returns its underlying
+    LangChain class and constructor parameters.
+
+    Local/proxy providers (ollama/lmstudio/openrouter) get fully
+    self-contained constructor_params (base_url + api_key already filled
+    in), since their model name is user/server-supplied rather than one of
+    a small fixed set. Cloud providers resolve to their LangChain class with
+    just the model name - AtelierAIEngine injects the actual API key.
     """
-    normalized_choice_lower = _normalize_model_name(model_name)
-    return _llm_config_map.get(normalized_choice_lower)
+    normalized = _normalize_model_name(model_name)
+    if ":" not in normalized:
+        return None  # every valid choice is "provider:model" - see get_model_choices()
+
+    provider, _, _ = normalized.partition(":")
+    model = model_name.split(":", 1)[1].strip()  # preserve original casing for the real API call
+
+    if provider == "ollama":
+        return {
+            'class': ChatOllama,
+            'constructor_params': {
+                'model': model,
+                'base_url': resolve_key("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL),
+            }
+        }
+
+    if provider == "lmstudio":
+        return {
+            'class': ChatOpenAI,
+            'constructor_params': {
+                'model': model,
+                'base_url': resolve_key("LMSTUDIO_BASE_URL", DEFAULT_LMSTUDIO_BASE_URL),
+                # LM Studio's local server doesn't validate this - it just
+                # has to be a non-empty string for the OpenAI client.
+                'api_key': 'lm-studio',
+            }
+        }
+
+    if provider == "openrouter":
+        return {
+            'class': ChatOpenAI,
+            'constructor_params': {
+                'model': model,
+                'base_url': OPENROUTER_BASE_URL,
+                'api_key': resolve_key("OPENROUTER_API_KEY"),
+            }
+        }
+
+    cls = _CLOUD_PROVIDER_CLASSES.get(provider)
+    if not cls:
+        return None
+    return {'class': cls, 'constructor_params': {'model': model}}

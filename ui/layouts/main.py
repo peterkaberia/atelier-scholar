@@ -1,5 +1,5 @@
 from dash import html, dcc
-from .sidebar import layout_sidebar
+from .sidebar import layout_sidebar, layout_mobile_topbar, layout_mobile_backdrop
 
 # ==========================================
 # 1. TAILWIND CONFIG & CUSTOM CSS INJECTION
@@ -48,11 +48,331 @@ index_string = '''
                             el.style.height = Math.min(el.scrollHeight, 120) + 'px';
                         }
                         return window.dash_clientside.no_update;
+                    },
+                    // Slides the mobile drawer sidebar in/out and toggles its
+                    // backdrop. Fired by either the hamburger button (open)
+                    // or the drawer's own close button / backdrop tap
+                    // (close) - all three share this one toggle.
+                    toggleMobileMenu: function(openClicks, closeClicks, backdropClicks) {
+                        var sidebar = document.getElementById('app-sidebar');
+                        var backdrop = document.getElementById('mobile-menu-backdrop');
+                        if (sidebar) {
+                            sidebar.classList.toggle('-translate-x-full');
+                            sidebar.classList.toggle('translate-x-0');
+                        }
+                        if (backdrop) {
+                            backdrop.classList.toggle('hidden');
+                        }
+                        return window.dash_clientside.no_update;
+                    },
+                    // Force the mobile drawer closed on every navigation, so
+                    // tapping a nav link doesn't leave it open over the new
+                    // page. (The Settings "Add Provider" dialogs don't need
+                    // an equivalent: their open/closed state lives in a
+                    // dcc.Store scoped to the /settings page content, so a
+                    // fresh navigation there always starts closed with no
+                    // reset needed - see ui/callbacks/settings.py.)
+                    closeMobileMenuOnNav: function(pathname) {
+                        var sidebar = document.getElementById('app-sidebar');
+                        var backdrop = document.getElementById('mobile-menu-backdrop');
+                        if (sidebar) {
+                            sidebar.classList.add('-translate-x-full');
+                            sidebar.classList.remove('translate-x-0');
+                        }
+                        if (backdrop) {
+                            backdrop.classList.add('hidden');
+                        }
+                        return window.dash_clientside.no_update;
                     }
                 }
             });
+
+            // Inline citation hover popups for the synthesis body
+            // (ui/layouts/feed.py's build_synthesis_body). The [N] markers
+            // arrive as plain escaped bracket TEXT inside dcc.Markdown's
+            // rendered prose (confirmed by direct inspection that embedding
+            // styled HTML there and relying on dcc.Markdown to preserve it
+            // does not work reliably - classes get stripped, elements get
+            // restructured). So instead: after the prose renders, walk its
+            // text nodes here and replace each "[N]" occurrence with a real
+            // interactive <span> - this operates on the live DOM via normal
+            // browser APIs, entirely bypassing dcc.Markdown's HTML-string
+            // parsing/sanitization, since nothing here is fed through it.
+            //
+            // Citation details ride along as a data-citations JSON
+            // attribute on the containing Div (a normal Dash prop, safe
+            // from the markdown pipeline since it's not markdown content).
+
+            function enrichSynthesisCitations(container) {
+                if (container.dataset.citationsEnriched) return;
+                // Dash/React can render this container before populating
+                // dcc.Markdown's actual text into it (e.g. content still
+                // streaming in from a background callback) - confirmed by
+                // direct inspection that running against an empty
+                // container marked itself "enriched" immediately, before
+                // the real text ever arrived, permanently blocking the
+                // later mutation (once text WAS there) from ever being
+                // retried by this same function's own early-return guard
+                // above. Bailing out without marking it lets the next
+                // MutationObserver tick (see initCitationWatcher) retry
+                // once there's actually something to process.
+                if (!container.textContent || !container.textContent.trim()) return;
+                var citations;
+                try { citations = JSON.parse(container.dataset.citations || '[]'); } catch (e) { return; }
+                if (!citations.length) { container.dataset.citationsEnriched = 'true'; return; }
+
+                // React/remark renders "[1]" as separate adjacent text
+                // nodes ("[", "1", "]") rather than one contiguous run -
+                // confirmed by direct inspection. normalize() merges
+                // adjacent text nodes back into one per run, which is what
+                // lets a single regex match "[1]" as a whole below.
+                container.normalize();
+
+                var walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+                var textNodes = [];
+                var node;
+                while ((node = walker.nextNode())) textNodes.push(node);
+
+                textNodes.forEach(function (textNode) {
+                    var text = textNode.textContent;
+                    var regex = /\[(\d+)\]/g;
+                    if (!regex.test(text)) return;
+                    regex.lastIndex = 0;
+
+                    var frag = document.createDocumentFragment();
+                    var lastIndex = 0;
+                    var match;
+                    while ((match = regex.exec(text)) !== null) {
+                        if (match.index > lastIndex) {
+                            frag.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+                        }
+                        var marker = document.createElement('span');
+                        marker.className = 'ref-badge-inline text-primary font-bold cursor-help hover:underline';
+                        marker.textContent = '[' + match[1] + ']';
+                        marker.dataset.idx = match[1];
+                        frag.appendChild(marker);
+                        lastIndex = match.index + match[0].length;
+                    }
+                    if (lastIndex < text.length) {
+                        frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+                    }
+                    textNode.parentNode.replaceChild(frag, textNode);
+                });
+
+                container.dataset.citationsEnriched = 'true';
+            }
+
+            // Runs on every DOM mutation, so it catches synthesis content
+            // however it arrives (initial render, background-callback
+            // update, chat history replay) without needing its own trigger.
+            //
+            // This whole <script> block runs while the parser is still
+            // inside <head> - document.body doesn't exist yet at this
+            // point, so observe(document.body, ...) would throw
+            // immediately and never actually start observing anything
+            // (confirmed by direct inspection: citations never got
+            // enriched on a real page load, only when triggered manually
+            // after the page had already fully loaded). Deferred to
+            // DOMContentLoaded, with an initial scan alongside it in case
+            // Dash has already rendered synthesis content by then.
+            function initCitationWatcher() {
+                document.querySelectorAll('.synthesis-citations:not([data-citations-enriched])').forEach(enrichSynthesisCitations);
+                var citationObserver = new MutationObserver(function () {
+                    document.querySelectorAll('.synthesis-citations:not([data-citations-enriched])').forEach(enrichSynthesisCitations);
+                });
+                citationObserver.observe(document.body, { childList: true, subtree: true });
+            }
+            if (document.body) {
+                initCitationWatcher();
+            } else {
+                document.addEventListener('DOMContentLoaded', initCitationWatcher);
+            }
+
+            // One shared floating popup element, repositioned per-hover
+            // rather than nested inside each marker - the marker can land
+            // anywhere inside a long paragraph, so an absolutely
+            // -positioned sibling wouldn't reliably have room; a
+            // viewport-fixed element positioned via getBoundingClientRect
+            // does.
+            var citationPopupEl = null;
+            function getCitationPopup() {
+                if (!citationPopupEl) {
+                    citationPopupEl = document.createElement('div');
+                    citationPopupEl.className = 'fixed z-[9999] w-72 p-4 glass-chat-bar text-slate-900 text-xs rounded-2xl shadow-2xl pointer-events-none flex flex-col gap-1.5';
+                    citationPopupEl.style.visibility = 'hidden';
+                    citationPopupEl.style.opacity = '0';
+                    citationPopupEl.style.transition = 'opacity 150ms';
+                    document.body.appendChild(citationPopupEl);
+                }
+                return citationPopupEl;
+            }
+
+            function setCitationPopupContent(popup, c) {
+                // Built via DOM methods (textContent), not innerHTML - c.title
+                // /c.snippet come from LLM-extracted paper data and should
+                // never be interpreted as markup.
+                popup.innerHTML = '';
+
+                var header = document.createElement('div');
+                header.className = 'flex justify-between items-start gap-2';
+                var badge = document.createElement('span');
+                badge.className = 'bg-primary/10 text-primary px-2 py-0.5 rounded text-[10px] font-bold uppercase shrink-0';
+                badge.textContent = 'SOURCE ' + c.index;
+                var meta = document.createElement('span');
+                meta.className = 'text-slate-400 italic text-[10px] text-right';
+                meta.textContent = c.year + (c.journal ? ' • ' + c.journal : '');
+                header.appendChild(badge);
+                header.appendChild(meta);
+
+                var titleEl = document.createElement('strong');
+                titleEl.className = 'text-sm leading-snug font-bold text-primary line-clamp-2';
+                titleEl.textContent = c.title;
+
+                var snippetEl = document.createElement('span');
+                snippetEl.className = 'text-slate-500 line-clamp-3 font-normal';
+                snippetEl.textContent = c.snippet;
+
+                popup.appendChild(header);
+                popup.appendChild(titleEl);
+                if (c.snippet) popup.appendChild(snippetEl);
+            }
+
+            document.addEventListener('mouseover', function (e) {
+                var marker = e.target.closest('.ref-badge-inline');
+                if (!marker) return;
+                var container = marker.closest('.synthesis-citations');
+                if (!container) return;
+                var citations;
+                try { citations = JSON.parse(container.dataset.citations || '[]'); } catch (err) { return; }
+                var c = citations.find(function (x) { return String(x.index) === marker.dataset.idx; });
+                if (!c) return;
+
+                var popup = getCitationPopup();
+                setCitationPopupContent(popup, c);
+
+                var rect = marker.getBoundingClientRect();
+                popup.style.left = rect.left + 'px';
+                popup.style.top = (rect.top - 8) + 'px';
+                popup.style.transform = 'translateY(-100%)';
+                popup.style.visibility = 'visible';
+                popup.style.opacity = '1';
+            });
+            document.addEventListener('mouseout', function (e) {
+                var marker = e.target.closest('.ref-badge-inline');
+                if (!marker) return;
+                var popup = getCitationPopup();
+                popup.style.visibility = 'hidden';
+                popup.style.opacity = '0';
+            });
+
+            // Study-type filter chips (ui/layouts/feed.py's build_paper_cards).
+            // Plain click delegation, not a Dash callback - these chips are
+            // pure client-side show/hide over cards Dash already rendered,
+            // and a session can have several independent paper-card lists
+            // on one page (original search + follow-ups), so lookups are
+            // scoped to the clicked chip's nearest ancestor rather than a
+            // page-wide id (which would collide across flow-blocks).
+            document.addEventListener('click', function (e) {
+                var chip = e.target.closest('.filter-chip-btn');
+                if (!chip) return;
+                var scope = chip.closest('.space-y-8');
+                var list = scope ? scope.querySelector('.paper-cards-list') : null;
+                if (!list) return;
+
+                var chipGroup = chip.parentElement;
+                if (chipGroup) {
+                    Array.prototype.forEach.call(chipGroup.querySelectorAll('.filter-chip-btn'), function (btn) {
+                        var isActive = btn === chip;
+                        btn.classList.toggle('active', isActive);
+                        btn.classList.toggle('bg-primary', isActive);
+                        btn.classList.toggle('text-white', isActive);
+                        btn.classList.toggle('border-primary', isActive);
+                        btn.classList.toggle('bg-white', !isActive);
+                        btn.classList.toggle('text-slate-600', !isActive);
+                        btn.classList.toggle('border-slate-200', !isActive);
+                    });
+                }
+
+                var wantType = chip.dataset.filterType;
+                Array.prototype.forEach.call(list.querySelectorAll('.atelier-result'), function (card) {
+                    var show = wantType === '__all__' || card.dataset.studyType === wantType;
+                    card.style.display = show ? '' : 'none';
+                });
+            });
+
+            // In-app PDF viewer (ui/layouts/feed.py's .pdf-viewer-btn) -
+            // opens the PDF in an iframe inside the app instead of
+            // navigating away (target=_blank) or replacing the page
+            // (target=_self). Pure client-side state, no Dash callback:
+            // which PDF to show never needs the server.
+            function closePdfViewer() {
+                var modal = document.getElementById('pdf-viewer-modal');
+                if (!modal) return;
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+                var iframe = document.getElementById('pdf-viewer-iframe');
+                if (iframe) iframe.src = ''; // stop the embed from loading/playing in the background once closed
+            }
+            document.addEventListener('click', function (e) {
+                var trigger = e.target.closest('.pdf-viewer-btn');
+                if (trigger) {
+                    var url = trigger.dataset.pdfUrl;
+                    if (!url) return;
+                    var modal = document.getElementById('pdf-viewer-modal');
+                    var iframe = document.getElementById('pdf-viewer-iframe');
+                    var newTabLink = document.getElementById('pdf-viewer-new-tab-link');
+                    if (!modal || !iframe) return;
+                    iframe.src = url;
+                    if (newTabLink) newTabLink.href = url;
+                    modal.classList.remove('hidden');
+                    modal.classList.add('flex');
+                    return;
+                }
+                if (e.target.closest('#pdf-viewer-close-btn')) {
+                    closePdfViewer();
+                    return;
+                }
+                // Clicking the dimmed backdrop itself (not the white card) also closes it.
+                if (e.target.id === 'pdf-viewer-modal') {
+                    closePdfViewer();
+                }
+            });
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape') closePdfViewer();
+            });
+
+            // Per-paper summary panel (ui/callbacks/library.py opens it by
+            // writing to its transform style + content; closing it is pure
+            // client-side, no reason to round-trip to the server just to
+            // hide something already rendered).
+            document.addEventListener('click', function (e) {
+                if (e.target.closest('#paper-summary-close-btn')) {
+                    var panel = document.getElementById('paper-summary-panel');
+                    if (panel) panel.style.transform = 'translateX(100%)';
+                }
+            });
+
+            // Enter submits, Shift+Enter inserts a newline - standard
+            // chat-app convention (Slack/Discord/ChatGPT). Both
+            // search-input (ui/layouts/feed.py's follow-up bar) and
+            // hero-search-input (ui/layouts/home.py's first-question box)
+            // are dcc.Textarea, which has no built-in "submit" prop the way
+            // dcc.Input's n_submit does for single-line inputs - a plain
+            // textarea just inserts a line break on every Enter with no
+            // way to distinguish "send" from "new line" without this
+            // handler.
+            document.addEventListener('keydown', function (e) {
+                if (e.key !== 'Enter' || e.shiftKey) return;
+                var el = e.target;
+                if (!el || (el.id !== 'search-input' && el.id !== 'hero-search-input')) return;
+                var btnId = el.id === 'search-input' ? 'search-btn' : 'hero-search-btn';
+                var btn = document.getElementById(btnId);
+                if (!btn || btn.disabled) return;
+                e.preventDefault(); // stop the textarea's own default newline insertion
+                btn.click();
+            });
         </script>
-        
+
         <style>
             /* Custom Scrollbar */
             ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -112,8 +432,11 @@ index_string = '''
             .dash-dropdown-trigger::after { content: "\\e5cf"; font-family: 'Material Symbols Outlined'; font-size: 16px !important; color: #94A3B8 !important; transition: color 0.2s ease; display: flex; align-items: center; }
             .group:hover .dash-dropdown-trigger::after { color: #1A237E !important; }
             
-            .dash-dropdown-menu { background-color: white !important; border-radius: 0.75rem !important; border: 1px solid #E2E8F0 !important; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1) !important; padding: 4px !important; }
+            .dash-dropdown-menu { background-color: white !important; border-radius: 0.75rem !important; border: 1px solid #E2E8F0 !important; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1) !important; padding: 4px !important; max-height: 320px !important; overflow-y: auto !important; }
             .dash-dropdown-item { font-size: 11px !important; font-weight: 700 !important; color: #475569 !important; padding: 8px 12px !important; border-radius: 0.5rem !important; text-transform: uppercase !important; letter-spacing: 0.05em !important; }
+            /* Rich (icon + two-line) dropdown options, e.g. Settings' provider pickers, opt out of the compact uppercase style above - it's tuned for short single-line model names, not these. */
+            .dash-dropdown-item:has(.dash-dropdown-option-rich) { text-transform: none !important; letter-spacing: normal !important; padding: 4px 12px !important; }
+            .dash-dropdown-option-rich { text-transform: none; }
             .dash-dropdown-item:hover, .dash-dropdown-item[data-highlighted] { background-color: #F8FAFC !important; color: #1A237E !important; }
         </style>
     </head>
@@ -143,40 +466,123 @@ def layout_no_llm():
     return html.Div(className="flex-1 flex flex-col items-center justify-center w-full h-full pb-32 px-8 bg-[#FDFDFD] dot-grid", children=[
         html.Span("key_off", className="material-symbols-outlined text-6xl text-red-400 mb-6 animate-fade-in"),
         html.H1("System Offline", className="text-4xl font-extrabold tracking-tighter text-slate-900 font-sans mb-4 animate-fade-in"),
-        html.P("No LLM API keys were detected in your environment.", className="text-xl font-serif italic text-slate-500 mb-8 max-w-lg text-center animate-fade-in", style={"animationDelay": "0.1s"}),
-        
+        html.P("No LLM API keys were detected.", className="text-xl font-serif italic text-slate-500 mb-8 max-w-lg text-center animate-fade-in", style={"animationDelay": "0.1s"}),
+
         html.Div(className="bg-red-50 border border-red-100 p-6 rounded-2xl max-w-xl text-left shadow-sm animate-fade-in", style={"animationDelay": "0.2s"}, children=[
             html.H3("How to fix this:", className="text-sm font-bold text-red-900 uppercase tracking-widest mb-4"),
             html.Ul(className="list-disc pl-5 space-y-2 text-sm text-red-800 font-medium", children=[
-                html.Li("Create or check your .env file in the project root."),
-                html.Li("Ensure you have added at least one valid API key (e.g., GROQ_API_KEY=...)."),
-                html.Li("Restart your Python server so the keys load into the environment.")
+                html.Li(["Add at least one API key in ", html.A("Settings", href="/settings", className="underline font-bold"), " (recommended - takes effect immediately, no restart)."]),
+                html.Li("Or add it to your .env file and restart the server."),
+            ])
+        ]),
+
+        dcc.Link(href="/settings", className="mt-8 animate-fade-in", style={"animationDelay": "0.3s"}, children=[
+            html.Button(className="scholar-gradient text-white px-8 py-3 rounded-xl flex items-center justify-center gap-2 hover:opacity-90 active:scale-95 transition-all shadow-lg shadow-primary/20", children=[
+                html.Span("key", className="material-symbols-outlined text-sm"),
+                html.Span("Open Settings", className="font-bold text-sm tracking-widest uppercase")
             ])
         ])
     ])
 
 def serve_layout():
-    return html.Div(className="h-screen flex overflow-hidden antialiased", children=[
+    return html.Div(className="h-screen flex flex-col md:flex-row overflow-hidden antialiased", children=[
         dcc.Location(id='url', refresh=False),
-        
-        # GLOBAL STATE
-        dcc.Store(id='store-all-records', data=[], storage_type='local'),
-        dcc.Store(id='store-processed-records', data=[], storage_type='local'),
-        dcc.Store(id='store-current-topic', data="", storage_type='local'),
-        dcc.Store(id='store-chat-history', data=[], storage_type='local'),
-        dcc.Store(id='store-user-history', data=[], storage_type='local'),
-        dcc.Store(id='store-synthesis-markdown', data="", storage_type='local'),
+
+        # PER-TAB WORKING STATE
+        # Deliberately storage_type='memory' (Dash's default - tied to this
+        # tab's own React tree only), NOT 'local'. 'local' backs onto
+        # window.localStorage, which is shared across every browser tab of
+        # the same origin - so two sessions running concurrently (e.g. one
+        # per tab) would both read/write the same global keys and clobber
+        # each other's title/records/synthesis mid-run. None of these need
+        # to survive a reload: a fresh page load reconstructs everything
+        # that matters (chat history, status) straight from the database via
+        # layout_feed()/poll_session_status, not from these stores.
+        dcc.Store(id='store-processed-records', data=[]),
+        dcc.Store(id='store-current-topic', data=""),
+        dcc.Store(id='store-chat-history', data=[]),
+        dcc.Store(id='store-synthesis-markdown', data=""),
         dcc.Store(id='store-pending-search', storage_type='session'),
-        
+
+        # Gate for every background-callback write that touches visible
+        # feed content (flow-container) or follow-up context (topic/
+        # processed records/chat history/synthesis) - route_intent,
+        # run_search, generate_synth, and run_chat (ui/callbacks/chat.py,
+        # search.py) all target THIS store instead of writing those
+        # directly, since a background job keeps running (and eventually
+        # writes its result) even after the user has navigated to a
+        # DIFFERENT session's page in the same tab - Dash Outputs target
+        # component IDs, not "whichever session the user is currently
+        # looking at", so an unguarded direct write would silently overwrite
+        # whatever the user navigated to with a stale, unrelated session's
+        # content. ui/callbacks/ui_extras.py's gate_flow_update is the one
+        # place that actually forwards this to the real stores, and only
+        # does so if the payload's session_id still matches
+        # current-session-id's LIVE value at that moment.
+        dcc.Store(id='pending-flow-update'),
+
         # FEED LOGIC TRIGGERS
         dcc.Store(id='trigger-router', data=""),
-        dcc.Store(id='trigger-search', data=""), 
+        dcc.Store(id='trigger-search', data=""),
         dcc.Store(id='trigger-synthesis', data=""),
         dcc.Store(id='trigger-chat', data=""),
 
-        # SIDEBAR
+        # MOBILE NAV TRIGGERS (see toggleMobileMenu/closeMobileMenuOnNav in app.py)
+        dcc.Store(id='mobile-menu-toggle-dummy', data=0),
+        dcc.Store(id='mobile-menu-nav-dummy', data=0),
+
+        # MOBILE TOP BAR - the sidebar's replacement when it's off-screen (<md)
+        layout_mobile_topbar(),
+
+        # MOBILE DRAWER BACKDROP
+        layout_mobile_backdrop(),
+
+        # SIDEBAR (static column on desktop, slide-in drawer on mobile)
         layout_sidebar(),
 
         # MAIN ROUTING CANVAS
-        html.Main(id="page-content", className="flex-1 flex flex-col relative h-full bg-[#FDFDFD] overflow-hidden")
+        html.Main(id="page-content", className="flex-1 flex flex-col relative h-full bg-[#FDFDFD] overflow-hidden"),
+
+        # PDF VIEWER MODAL - opened/closed entirely client-side (JS click
+        # delegation in this file's index_string, see .pdf-viewer-btn):
+        # which PDF to show is pure ephemeral UI state with no server round
+        # trip needed, unlike the paper-summary panel below which needs an
+        # LLM call. Ships hidden/empty; JS sets the iframe src and toggles
+        # visibility. The "open in new tab" link is a permanent fallback,
+        # not conditional - iframes can't reliably tell JS when a publisher
+        # blocks embedding via X-Frame-Options, so rather than guess, the
+        # escape hatch is always visible.
+        # z-[350]: higher than paper-summary-panel's z-[300] below - the PDF
+        # viewer can be opened FROM WITHIN that panel (its own "View PDF"
+        # button) and must stack above it, not behind it. Both are well
+        # above the chat bar's z-[100] and the sidebar's z-[200] - they
+        # previously used the Tailwind default z-50, which put them BEHIND
+        # both (confirmed live: the popups rendered under the bottom chat
+        # bar and the sidebar).
+        html.Div(id='pdf-viewer-modal', className="fixed inset-0 z-[350] hidden items-center justify-center bg-black/60 backdrop-blur-sm p-4", children=[
+            html.Div(className="bg-white rounded-2xl shadow-2xl w-full h-full max-w-5xl flex flex-col overflow-hidden", children=[
+                html.Div(className="flex items-center justify-between px-5 py-3 border-b border-slate-200 flex-shrink-0", children=[
+                    html.Span("PDF Viewer", className="font-bold text-slate-700 text-sm"),
+                    html.Div(className="flex items-center gap-5", children=[
+                        html.A("Open in new tab ↗", id='pdf-viewer-new-tab-link', href="#", target="_blank", className="text-xs font-bold text-primary hover:underline"),
+                        html.Button(html.Span("close", className="material-symbols-outlined"), id='pdf-viewer-close-btn', className="text-slate-400 hover:text-slate-900 flex items-center")
+                    ])
+                ]),
+                html.Iframe(id='pdf-viewer-iframe', src="", className="flex-1 w-full border-0")
+            ])
+        ]),
+
+        # PER-PAPER SUMMARY PANEL - opened by a Dash callback
+        # (ui/callbacks/library.py's summarize_selected_paper, since it
+        # needs a server-side LLM call), closed purely client-side (no
+        # server round trip needed just to hide it again).
+        html.Div(id='paper-summary-panel', className="fixed top-0 right-0 z-[300] h-full w-full md:w-[420px] bg-white shadow-2xl border-l border-slate-200 flex flex-col", style={"transform": "translateX(100%)", "transition": "transform 0.25s ease-out"}, children=[
+            html.Div(className="flex items-center justify-between px-5 py-4 border-b border-slate-200 flex-shrink-0", children=[
+                html.Span("Paper Summary", className="font-bold text-slate-700 text-sm uppercase tracking-widest"),
+                html.Button(html.Span("close", className="material-symbols-outlined"), id='paper-summary-close-btn', className="text-slate-400 hover:text-slate-900 flex items-center")
+            ]),
+            dcc.Loading(html.Div(id='paper-summary-content', className="flex-1 overflow-y-auto p-5 text-sm text-slate-700 leading-relaxed space-y-3")),
+        ]),
+
+        dcc.Download(id='download-references'),
     ])
