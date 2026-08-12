@@ -3,6 +3,7 @@ import logging
 import uuid
 from dash import html, Input, Output, State, callback, no_update
 
+from core.logger import setup_global_logging
 from core.utils import is_yes_no_question, order_citations_by_appearance
 from database import AtelierRepository, Record
 from database.models import SessionModel
@@ -90,6 +91,23 @@ def run_search(set_progress, search_data):
     dropping whatever route_intent had just added (this is confirmed to
     have happened - see route_intent's docstring).
     """
+    # Dash's DiskcacheManager runs every background=True callback in a
+    # spawned subprocess (via the `multiprocess`/dill library, NOT stdlib
+    # multiprocessing) that unpickles this function's closure directly -
+    # confirmed by direct inspection that app.py never gets imported there,
+    # so app.py's own module-level setup_global_logging() call (which only
+    # ever runs in the real server process and the Werkzeug reloader's
+    # child) never reaches this process. Without this, the root logger here
+    # has zero handlers and sits at the default WARNING level, silently
+    # dropping every logger.info() call in this function AND everything it
+    # calls into (search/paper.py, pipeline/nodes.py, database/repository.py
+    # ...) - confirmed as the cause of a live "logging isn't logging"
+    # report, where background-job output (the vast majority of the app's
+    # actual logging) simply never appeared anywhere. Idempotent (guards on
+    # `if not root_logger.handlers`), so calling it on every invocation is
+    # harmless.
+    setup_global_logging()
+
     query = search_data.get('query')
     selected_llm = search_data.get('llm')
     session_id = search_data.get("session_id")
@@ -159,6 +177,10 @@ def generate_synth(synth_data):
     """
     if not synth_data:
         raise dash.exceptions.PreventUpdate
+
+    # See run_search's identical call/comment above - this callback is its
+    # own separate spawned subprocess too.
+    setup_global_logging()
 
     query = synth_data.get('query')
     selected_llm = synth_data.get('llm')

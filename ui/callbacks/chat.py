@@ -2,6 +2,7 @@ import html
 import dash
 import logging
 from dash import html, ALL, Input, Output, State, callback, no_update
+from core.logger import setup_global_logging
 from core.utils import order_citations_by_appearance
 from database.repository import AtelierRepository
 from database.models import SessionModel
@@ -177,6 +178,12 @@ def route_intent(router_data, current_topic, processed_records):
     follow-up asking to "write an abstract with the info you have"
     triggered a full new pipeline run instead of ever reaching CHAT.
     """
+    # Every background=True callback runs in its own spawned subprocess
+    # that never imports app.py - see run_search's identical call/comment
+    # in ui/callbacks/search.py for why this has to be called here rather
+    # than relying on app.py's module-level setup_global_logging().
+    setup_global_logging()
+
     query = router_data.get('query')
     selected_llm = router_data.get('llm')
     session_id = router_data.get('session_id')
@@ -312,6 +319,9 @@ def run_chat(chat_data, chat_history):
     if not chat_data or not chat_data.get('query'):
         raise dash.exceptions.PreventUpdate
 
+    # See route_intent's identical call/comment above - own subprocess too.
+    setup_global_logging()
+
     query = chat_data.get('query')
     selected_llm = chat_data.get('llm')
     session_id = chat_data.get('session_id')
@@ -443,6 +453,9 @@ def run_investigation(set_progress, investigate_data, chat_history):
     """
     if not investigate_data or not investigate_data.get('query'):
         raise dash.exceptions.PreventUpdate
+
+    # See route_intent's identical call/comment above - own subprocess too.
+    setup_global_logging()
 
     query = investigate_data.get('query')
     selected_llm = investigate_data.get('llm')

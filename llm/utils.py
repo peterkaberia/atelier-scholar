@@ -33,13 +33,22 @@ class BufferedStreamingHandler(BaseCallbackHandler):
     def on_llm_new_token(self, token: str, **kwargs) -> None:
         self.buffer += token
         if "\n" in token or len(self.buffer) >= self.buffer_limit:
-            logger.info(self.buffer)
+            # No logger.info(self.buffer) here (removed) - ui_callback is
+            # never actually supplied anywhere in this codebase (confirmed
+            # by grep - every real LLM call goes through
+            # llm.engine's _common_llm_params, which instantiates this with
+            # no ui_callback), so this was doing nothing but dumping every
+            # LLM call's full raw streamed output into the app's real
+            # diagnostic log, one ~60-char or newline-delimited chunk per
+            # log line - confirmed live as the cause of a "logging is not
+            # logging" report where this garbled noise was the ONLY thing
+            # visible, drowning out (and looking like the absence of) the
+            # actual operational logging elsewhere.
             if self.ui_callback:
                 self.ui_callback(self.buffer)
             self.buffer = ""
 
     def on_llm_end(self, response, **kwargs) -> None:
-        logger.info(self.buffer)
         if self.buffer and self.ui_callback:
             self.ui_callback(self.buffer)
             self.buffer = ""
