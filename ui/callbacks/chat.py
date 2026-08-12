@@ -2,11 +2,13 @@ import html
 import dash
 import logging
 from dash import html, ALL, Input, Output, State, callback, no_update
+from core.utils import order_citations_by_appearance
 from database.repository import AtelierRepository
 from database.models import SessionModel
 from llm import AtelierAIEngine
+from pipeline.agent import run_investigation as run_investigation_agent
 from pipeline.nodes import extract_records
-from ui.layouts import build_flow_header, build_loading_skeleton, build_synthesis_body
+from ui.layouts import build_flow_header, build_loading_skeleton, build_paper_cards, build_synthesis_body
 from .background import background_manager
 
 logger = logging.getLogger(__name__)
@@ -130,6 +132,7 @@ def handle_feed_interactions(session_id, bottom_clicks, pending_search, bottom_t
 @callback(
     Output('trigger-search', 'data', allow_duplicate=True),
     Output('trigger-chat', 'data', allow_duplicate=True),
+    Output('trigger-investigate', 'data', allow_duplicate=True),
     Output('pending-flow-update', 'data', allow_duplicate=True),
     Input('trigger-router', 'data'),
     State('store-current-topic', 'data'),
@@ -146,11 +149,11 @@ def route_intent(router_data, current_topic, processed_records):
 
     Writes flow-container through pending-flow-update, not directly - see
     ui/callbacks/ui_extras.py's gate_flow_update docstring. trigger-search/
-    trigger-chat stay direct (ungated): those drive the actual pipeline
-    work (search, extraction, persistence), which must still complete and
-    save even if the user has since navigated away from this session's
-    page - only the VISUAL update should be suppressed in that case, not
-    the underlying work.
+    trigger-chat/trigger-investigate stay direct (ungated): those drive the
+    actual pipeline work (search, extraction, persistence), which must
+    still complete and save even if the user has since navigated away from
+    this session's page - only the VISUAL update should be suppressed in
+    that case, not the underlying work.
 
     existing_flows comes from router_data (handed off by whichever
     callback triggered this), NOT from State('flow-container', 'children').
@@ -222,8 +225,9 @@ def route_intent(router_data, current_topic, processed_records):
             if extra_records:
                 expanded_records = processed_records + extra_records
                 recheck = engine.followup_chat(query=query, current_topic=current_topic, processed_records=expanded_records)
-                if recheck.get("intent", "SEARCH").upper() == "CHAT":
-                    route = "CHAT"
+                recheck_intent = recheck.get("intent", "SEARCH").upper()
+                if recheck_intent in ("CHAT", "INVESTIGATE"):
+                    route = recheck_intent
                     processed_records = expanded_records
 
     existing_flows.pop() # Remove routing skeleton
@@ -234,7 +238,17 @@ def route_intent(router_data, current_topic, processed_records):
         existing_flows.append(build_loading_skeleton(search_query, "Planning your search..."))
         pending = {"session_id": session_id, "updates": {"flow_container": existing_flows}}
         search_trigger = {"query": search_query, "llm": selected_llm, "session_id": session_id, "existing_flows": existing_flows}
-        return search_trigger, no_update, pending
+        return search_trigger, no_update, no_update, pending
+
+    elif "INVESTIGATE" in route:
+        # run_investigation (this file, below) takes over - a ReAct agent
+        # (pipeline/agent.py) that digs into the existing papers more
+        # actively than plain CHAT, falling back to plain CHAT itself if
+        # the agent fails - see run_investigation's docstring.
+        existing_flows.append(build_loading_skeleton(query, "Investigating your question...", icon="travel_explore", spin=False))
+        pending = {"session_id": session_id, "updates": {"flow_container": existing_flows}}
+        investigate_trigger = {"query": query, "llm": selected_llm, "session_id": session_id, "existing_flows": existing_flows}
+        return no_update, no_update, investigate_trigger, pending
 
     else:
         existing_flows.append(build_loading_skeleton(query, "Deep diving into context...", icon="psychology", spin=False))
@@ -246,7 +260,7 @@ def route_intent(router_data, current_topic, processed_records):
         # reason existing_flows already is - see this function's own
         # docstring.
         chat_trigger = {"query": query, "llm": selected_llm, "session_id": session_id, "existing_flows": existing_flows, "processed_records": processed_records}
-        return no_update, chat_trigger, pending
+        return no_update, chat_trigger, no_update, pending
 
 @callback(
     Output('pending-flow-update', 'data', allow_duplicate=True),
@@ -321,8 +335,18 @@ def run_chat(chat_data, chat_history):
             context_records=processed_records
         )
 
+        # Renumber [N] citations by order of first appearance in the reply,
+        # not the pre-assigned context_records order - same reasoning as
+        # generate_synth's identical step in ui/callbacks/search.py, see
+        # core.utils.order_citations_by_appearance's docstring. Also means
+        # this reply's own reference numbering doesn't need to (and won't)
+        # match any other turn's, even for the same overlapping papers.
+        ai_response, processed_records = order_citations_by_appearance(
+            ai_response, [(str(i + 1), r) for i, r in enumerate(processed_records)]
+        )
+
         # 4. Save the interaction and citations to the SQLite database
-        AtelierRepository.save_query_with_citations(
+        new_query_id = AtelierRepository.save_query_with_citations(
             session_id=session_id,
             prompt=query,
             synthesis=ai_response,
@@ -334,13 +358,34 @@ def run_chat(chat_data, chat_history):
         chat_history.append({"role": "assistant", "content": ai_response})
 
         # 6. Build the new visual block for the Feed UI
+        #
+        # Includes build_paper_cards(), matching what layout_feed's
+        # historical reconstruction renders for every chat turn on reload -
+        # a prior version of this omitted it here specifically to avoid
+        # duplicating the library table on every follow-up, but that made
+        # the Results/Evidence Library section for a follow-up genuinely
+        # absent from the LIVE update and only ever visible after a reload
+        # (confirmed live - the "results section only visible after
+        # reload" bug). ui/layouts/main.py's index_string collapses every
+        # flow-block's Results section except the newest one by default
+        # (results-accordion-body), so repeating it per turn no longer
+        # means repeating it VISIBLY per turn either.
         new_flow = html.Div(className="flow-block border-t border-slate-100", children=[
-            build_flow_header(query, selected_llm, f"{len(processed_records)} Context Papers"),
-            build_synthesis_body(ai_response, valid_records=processed_records)
-            # Note: We omit build_paper_cards() here so we don't duplicate the
-            # library table every single time the user asks a follow-up question.
+            build_flow_header(query, selected_llm, f"{len(processed_records)} Context Papers", query_id=new_query_id),
+            build_synthesis_body(ai_response, valid_records=processed_records),
+            build_paper_cards(processed_records, query_id=new_query_id, session_id=session_id),
         ])
 
+        # Remove route_intent's "Deep diving into context..." skeleton
+        # (the last element of existing_flows - see route_intent's
+        # docstring) before appending the real answer - without this the
+        # skeleton was never replaced, just left permanently stranded
+        # above the finished turn (confirmed live via screenshot: both the
+        # spinner block AND the completed answer block visible at once,
+        # forever - run_search/generate_synth already pop their own
+        # skeleton the same way, this just never got the same treatment).
+        if existing_flows:
+            existing_flows.pop()
         existing_flows.append(new_flow)
         logger.info("Chat follow-up generated and saved successfully.")
 
@@ -356,9 +401,139 @@ def run_chat(chat_data, chat_history):
                 html.Span(f"Request interrupted or failed: {str(e)}", className="font-bold")
             ])
         ])
+        if existing_flows:
+            existing_flows.pop()  # same skeleton-removal reasoning as the success path above
         existing_flows.append(error_flow)
 
         # chat_history still gets the user's message even though the
         # assistant's reply failed - matches the previous (pre-gating)
         # behavior of always returning chat_history here.
+        return {"session_id": session_id, "updates": {"flow_container": existing_flows, "chat_history": chat_history}}
+
+
+@callback(
+    Output('pending-flow-update', 'data', allow_duplicate=True),
+    Input('trigger-investigate', 'data'),
+    State('store-chat-history', 'data'),
+    background=True,
+    manager=background_manager(),
+    progress=[Output('pending-flow-update', 'data', allow_duplicate=True)],
+    cancel=[Input("search-btn", "n_clicks")],
+    prevent_initial_call=True
+)
+def run_investigation(set_progress, investigate_data, chat_history):
+    """
+    Runs pipeline.agent's ReAct investigation agent for a follow-up routed
+    to INVESTIGATE (see route_intent). Live per-tool-call progress via
+    set_progress mirrors run_search's report() closure - the agent can take
+    a while (multiple tool calls, each potentially its own LLM round trip),
+    so this avoids sitting on one opaque spinner the whole time.
+
+    existing_flows comes from investigate_data (handed off by route_intent),
+    not State('flow-container', 'children') - same race-condition reasoning
+    as run_chat/run_search - see route_intent's docstring.
+
+    Citation format conversion: the agent cites papers by fingerprint (e.g.
+    "[doi:10.1234/xyz]" - see pipeline/agent.py's system prompt), but the
+    rest of Atelier's citation UI (build_synthesis_body's hover-popup JS)
+    expects sequential [1]/[2] brackets positionally indexed into
+    valid_records. Rewritten below so investigation answers get the exact
+    same interactive citation treatment as a normal synthesis/chat answer,
+    not plain unclickable bracket text.
+    """
+    if not investigate_data or not investigate_data.get('query'):
+        raise dash.exceptions.PreventUpdate
+
+    query = investigate_data.get('query')
+    selected_llm = investigate_data.get('llm')
+    session_id = investigate_data.get('session_id')
+    existing_flows = investigate_data.get('existing_flows') or []
+
+    if chat_history is None:
+        chat_history = []
+    chat_history.append({"role": "user", "content": query})
+
+    def report(label: str):
+        live_flows = existing_flows[:-1] + [build_loading_skeleton(query, label, icon="travel_explore", spin=False)]
+        set_progress([{"session_id": session_id, "updates": {"flow_container": live_flows}}])
+
+    try:
+        logger.info(f"Running investigation agent for session '{session_id}'...")
+        result = run_investigation_agent(
+            session_id=session_id,
+            query=query,
+            model_choice=selected_llm,
+            chat_history=chat_history,
+            progress_callback=report,
+        )
+
+        # Citations are determined by scanning the answer TEXT for
+        # [fingerprint] markers against every paper in this session, not
+        # from result['cited_fingerprints'] (a live side-effect of tools
+        # actually executing) - confirmed live that a checkpoint-resumed
+        # agent run can answer entirely from tool results already recorded
+        # in a prior checkpointed run without re-invoking any tools this
+        # time, leaving cited_fingerprints empty even though the answer
+        # genuinely cites specific papers. Scanning the text itself is
+        # correct regardless of whether tools freshly ran or the agent
+        # resumed from checkpoint.
+        #
+        # order_citations_by_appearance also fixes the renumbering itself:
+        # this used to assign [1]/[2]/... by iterating session papers in
+        # relevance-score order, not by where each fingerprint actually
+        # FIRST appears in the answer, and did the substitution via
+        # sequential .replace() calls - both wrong, see that function's
+        # docstring for why (citation order should follow the text, and
+        # sequential replace() can corrupt overlapping renumberings).
+        candidates = [
+            (rec.fingerprint, rec.__dict__)
+            for rec in AtelierRepository.get_session_processed_papers(session_id, limit=100)
+        ]
+        answer_text, valid_records = order_citations_by_appearance(result["answer"], candidates)
+
+        new_query_id = AtelierRepository.save_query_with_citations(
+            session_id=session_id,
+            prompt=query,
+            synthesis=answer_text,
+            model_used=selected_llm,
+            cited_records=valid_records,
+        )
+
+        chat_history.append({"role": "assistant", "content": answer_text})
+
+        ref_label = f"{len(valid_records)} Papers Investigated" if not result.get("fell_back") else f"{len(valid_records)} Context Papers"
+        # build_paper_cards() included for the same reason as run_chat's
+        # identical addition above - see its comment. Historical
+        # reconstruction (layout_feed) already rendered this on reload;
+        # this was the gap that made it look reload-only live.
+        new_flow = html.Div(className="flow-block border-t border-slate-100", children=[
+            build_flow_header(query, selected_llm, ref_label, query_id=new_query_id),
+            build_synthesis_body(answer_text, title="Investigation", valid_records=valid_records),
+            build_paper_cards(valid_records, query_id=new_query_id, session_id=session_id),
+        ])
+        # Remove route_intent's "Investigating your question..." skeleton
+        # (the last element of existing_flows) before appending the real
+        # answer - report()'s set_progress calls above only ever pushed a
+        # LOCAL live_flows copy, never mutated existing_flows itself, so
+        # without this pop the skeleton was left permanently stranded
+        # above the finished turn - same bug and fix as run_chat's
+        # identical addition above, see its comment for the full story.
+        if existing_flows:
+            existing_flows.pop()
+        existing_flows.append(new_flow)
+        logger.info(f"Investigation complete for session '{session_id}' (fell_back={result.get('fell_back')}).")
+
+        return {"session_id": session_id, "updates": {"flow_container": existing_flows, "chat_history": chat_history}}
+
+    except Exception as e:
+        logger.error(f"Investigation failed: {e}")
+        error_flow = html.Div(className="py-12 px-4 md:px-12 bg-red-50/30 border-t border-red-100", children=[
+            html.Div(className="max-w-5xl mx-auto flex items-center space-x-3 text-red-600", children=[
+                html.Span("error", className="material-symbols-outlined text-2xl"),
+                html.Span(f"Investigation interrupted or failed: {str(e)}", className="font-bold")
+            ])
+        ])
+        if existing_flows:
+            existing_flows.pop()  # same skeleton-removal reasoning as the success path above
+        existing_flows.append(error_flow)
         return {"session_id": session_id, "updates": {"flow_container": existing_flows, "chat_history": chat_history}}

@@ -3,7 +3,7 @@ import logging
 import uuid
 from dash import html, Input, Output, State, callback, no_update
 
-from core.utils import is_yes_no_question
+from core.utils import is_yes_no_question, order_citations_by_appearance
 from database import AtelierRepository, Record
 from database.models import SessionModel
 from llm import AtelierAIEngine
@@ -175,6 +175,19 @@ def generate_synth(synth_data):
     try:
         engine = AtelierAIEngine(model_choice=selected_llm)
         raw_md = engine.generate_copilot_synthesis(topic=query, valid_records=processed_records)
+
+        # Renumber [N] citations by the order they actually appear in the
+        # text, not the relevance-rank order they were pre-assigned in
+        # before the LLM wrote anything (generate_copilot_synthesis cites
+        # using indices matching processed_records' existing order, and the
+        # LLM's narrative doesn't necessarily follow that same order) - see
+        # core.utils.order_citations_by_appearance's docstring. Reorders
+        # processed_records to match, BEFORE generate_atelier_meter below,
+        # since the meter's own paper_index positions need to line up with
+        # whatever order actually ships to the UI/DB.
+        raw_md, processed_records = order_citations_by_appearance(
+            raw_md, [(str(i + 1), r) for i, r in enumerate(processed_records)]
+        )
 
         # Atelier Meter: only attempted for queries that read as yes/no
         # research questions (cheap local check first - see

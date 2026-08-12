@@ -162,6 +162,115 @@ index_string = '''
                 container.dataset.citationsEnriched = 'true';
             }
 
+            // Keeps only the LATEST turn's Results/Evidence-Library section
+            // (ui/layouts/feed.py's build_paper_cards, .results-accordion-
+            // body) expanded, and follows the page down to whichever
+            // flow-block is currently active - a new turn just appended, or
+            // an in-progress one whose status text is still updating in
+            // place (run_search's report()/run_investigation's report()
+            // closures re-render the SAME last block repeatedly rather than
+            // appending a new one per stage).
+            //
+            // Purely count-of-.flow-block-driven, not per-mutation: the
+            // mutation observer below also fires for unrelated changes
+            // (checkbox clicks, citation enrichment, dropdown menus...) -
+            // gating the accordion re-collapse on "did the number of turns
+            // actually change" is what lets a user's own manual toggle (see
+            // the click handler further down) stick between turns instead
+            // of being fought on every unrelated re-render.
+            var lastFlowBlockCount = null;
+            var flowScrollDebounceTimer = null;
+            function enforceActiveFlowBlock() {
+                var container = document.getElementById('flow-container');
+                if (!container) return;
+                var blocks = container.querySelectorAll(':scope > .flow-block');
+                if (!blocks.length) return;
+
+                var isFirstRun = lastFlowBlockCount === null;
+                var countChanged = blocks.length !== lastFlowBlockCount;
+                // Near the bottom already (e.g. actively watching a
+                // multi-stage progress update stream in) - keep following
+                // it. Not near the bottom - the user has deliberately
+                // scrolled up to read an earlier turn, so don't yank them
+                // back down just because that earlier turn's DOM mutated.
+                var wasNearBottom = (container.scrollHeight - container.scrollTop - container.clientHeight) < 250;
+
+                if (countChanged) {
+                    blocks.forEach(function (block, i) {
+                        var isLast = i === blocks.length - 1;
+                        var body = block.querySelector('.results-accordion-body');
+                        var chevron = block.querySelector('.accordion-chevron');
+                        if (body) body.classList.toggle('hidden', !isLast);
+                        if (chevron) chevron.classList.toggle('rotate-180', !isLast);
+                    });
+                    lastFlowBlockCount = blocks.length;
+                }
+
+                // Skip the very first call (initial page load/reload) -
+                // landing pre-scrolled with an animated jump the instant
+                // the page appears reads as a glitch, not a feature; the
+                // accordion state above still gets set correctly either way.
+                if (isFirstRun) return;
+                if (!countChanged && !wasNearBottom) return;
+
+                // Debounced with a real timer, not just coalesced into one
+                // scroll per animation frame - confirmed live that a single
+                // freshly-rendered answer fires a BURST of individual
+                // mutations (enrichSynthesisCitations above replaces one
+                // text node per [N] marker, one mutation each), and issuing
+                // a fresh scrollIntoView for every one of them repeatedly
+                // interrupted the previous call's still-in-flight smooth
+                // animation - visually indistinguishable from the page
+                // randomly jumping. Waiting for the burst to go quiet for
+                // 250ms and firing exactly once fixes that; a later
+                // qualifying mutation (e.g. the next stage's progress text)
+                // still resets and fires its own scroll in turn.
+                var targetBlock = blocks[blocks.length - 1];
+                var scrollToStart = countChanged;
+                if (flowScrollDebounceTimer) clearTimeout(flowScrollDebounceTimer);
+                flowScrollDebounceTimer = setTimeout(function () {
+                    flowScrollDebounceTimer = null;
+                    targetBlock.scrollIntoView({ behavior: 'smooth', block: scrollToStart ? 'start' : 'end' });
+                }, 250);
+            }
+
+            // True only when at least one mutation in this batch actually
+            // touched #flow-container's own subtree - the observer below is
+            // necessarily attached to document.body (see its own comment:
+            // #flow-container doesn't exist yet when this script first
+            // runs, and gets fully replaced on every route navigation), so
+            // without this check, completely unrelated activity ANYWHERE on
+            // the page - the sidebar's 3-second status poll
+            // (ui/callbacks/ui_extras.py's update_sidebar_history), the
+            // citation hover popup's one-time creation, a Settings dialog -
+            // was triggering the exact same "near bottom -> scroll" path
+            // above and jumping the feed out from under a user who wasn't
+            // even touching it (confirmed as the dominant cause of the
+            // reported random jumping, separate from the burst-mutation
+            // issue the debounce above fixes).
+            function touchesFlowContainer(mutationsList) {
+                for (var i = 0; i < mutationsList.length; i++) {
+                    var t = mutationsList[i].target;
+                    if (t && t.nodeType === 1 && t.closest('#flow-container')) return true;
+                }
+                return false;
+            }
+
+            // Manual override for the accordion above - a click anywhere on
+            // a flow-block's results-accordion-toggle (ui/layouts/feed.py's
+            // build_paper_cards) flips just that block's body, independent
+            // of enforceActiveFlowBlock's count-based auto-collapse.
+            document.addEventListener('click', function (e) {
+                var toggle = e.target.closest('.results-accordion-toggle');
+                if (!toggle) return;
+                var block = toggle.closest('.flow-block');
+                var body = block ? block.querySelector('.results-accordion-body') : null;
+                var chevron = toggle.querySelector('.accordion-chevron');
+                if (!body) return;
+                body.classList.toggle('hidden');
+                if (chevron) chevron.classList.toggle('rotate-180');
+            });
+
             // Runs on every DOM mutation, so it catches synthesis content
             // however it arrives (initial render, background-callback
             // update, chat history replay) without needing its own trigger.
@@ -177,8 +286,10 @@ index_string = '''
             // Dash has already rendered synthesis content by then.
             function initCitationWatcher() {
                 document.querySelectorAll('.synthesis-citations:not([data-citations-enriched])').forEach(enrichSynthesisCitations);
-                var citationObserver = new MutationObserver(function () {
+                enforceActiveFlowBlock();
+                var citationObserver = new MutationObserver(function (mutationsList) {
                     document.querySelectorAll('.synthesis-citations:not([data-citations-enriched])').forEach(enrichSynthesisCitations);
+                    if (touchesFlowContainer(mutationsList)) enforceActiveFlowBlock();
                 });
                 citationObserver.observe(document.body, { childList: true, subtree: true });
             }
@@ -415,8 +526,19 @@ index_string = '''
             .prose h3 { font-size: 0.75rem; font-weight: 700; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.15em; margin-bottom: 1rem; margin-top: 1.5rem; }
             .prose p { color: #334155; font-weight: 500; font-size: 0.95rem; line-height: 1.6; }
             .prose ul { list-style: none; padding-left: 0; }
-            .prose li { display: flex; align-items: flex-start; margin-bottom: 1rem; color: #334155; font-weight: 500; }
-            .prose li::before { content: '\\e86c'; font-family: 'Material Symbols Outlined'; color: #1A237E; font-size: 1.25rem; margin-right: 0.75rem; margin-top: -0.1rem; }
+            /* position:relative + absolutely-positioned ::before icon, NOT
+               display:flex on the <li> itself - flex would treat EVERY
+               direct child as its own flex item, including a <strong>
+               bold label followed by a plain text node (a routine markdown
+               pattern: "- **Label**: description [1]"), laying the bold
+               run and the rest of the sentence out as separate columns
+               instead of one wrapping paragraph. Confirmed live: exactly
+               this pattern misaligned an LLM-generated recommendations
+               list. Normal block flow (no flex) lets inline content -
+               bold, plain text, citation badges - wrap together correctly
+               regardless of how many separate inline nodes make it up. */
+            .prose li { position: relative; padding-left: 2rem; margin-bottom: 1rem; color: #334155; font-weight: 500; }
+            .prose li::before { content: '\\e86c'; font-family: 'Material Symbols Outlined'; color: #1A237E; font-size: 1.25rem; position: absolute; left: 0; top: -0.1rem; line-height: 1; }
             .prose table { min-width: 100%; border: 1px solid #F1F5F9; border-radius: 1rem; border-collapse: separate; border-spacing: 0; overflow: hidden; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); margin-top: 1rem; }
             .prose th { background-color: rgba(248, 250, 252, 0.5); padding: 1rem 1.5rem; text-align: left; font-weight: 700; color: #1A237E; text-transform: uppercase; font-size: 0.625rem; letter-spacing: 0.1em; border-bottom: 1px solid #F1F5F9; }
             .prose td { padding: 1.25rem 1.5rem; font-weight: 500; color: #64748B; border-bottom: 1px solid rgba(248, 250, 252, 0.5); font-size: 0.875rem;}
@@ -526,6 +648,7 @@ def serve_layout():
         dcc.Store(id='trigger-search', data=""),
         dcc.Store(id='trigger-synthesis', data=""),
         dcc.Store(id='trigger-chat', data=""),
+        dcc.Store(id='trigger-investigate', data=""),
 
         # MOBILE NAV TRIGGERS (see toggleMobileMenu/closeMobileMenuOnNav in app.py)
         dcc.Store(id='mobile-menu-toggle-dummy', data=0),
@@ -581,8 +704,29 @@ def serve_layout():
                 html.Span("Paper Summary", className="font-bold text-slate-700 text-sm uppercase tracking-widest"),
                 html.Button(html.Span("close", className="material-symbols-outlined"), id='paper-summary-close-btn', className="text-slate-400 hover:text-slate-900 flex items-center")
             ]),
-            dcc.Loading(html.Div(id='paper-summary-content', className="flex-1 overflow-y-auto p-5 text-sm text-slate-700 leading-relaxed space-y-3")),
+            # flex-1 min-h-0 lives on dcc.Loading itself, not just the inner
+            # content div - dcc.Loading renders its own wrapper div around
+            # its child, so the PANEL's flex-col layout was sizing THAT
+            # wrapper (which had no flex-1 of its own) to its content's
+            # natural height instead of constraining it to the remaining
+            # panel space. With no bounded height anywhere in the chain,
+            # the inner div's overflow-y-auto had nothing to actually
+            # engage against - content just overflowed the panel with no
+            # scrollbar (confirmed live). min-h-0 overrides a flex item's
+            # default min-height:auto, which otherwise refuses to shrink
+            # below its content size even with flex-1 set - the other half
+            # of the same overflow-in-flex gotcha.
+            dcc.Loading(
+                html.Div(id='paper-summary-content', className="h-full overflow-y-auto p-5 text-sm text-slate-700 leading-relaxed space-y-3"),
+                # parent_className (not className) - it's the one that
+                # lands on dcc.Loading's OUTERMOST wrapper div (confirmed
+                # via dash's own component metadata: className only reaches
+                # an inner "root DOM node", not what the panel's flex-col
+                # layout actually sizes as this child's box).
+                parent_className="flex-1 min-h-0",
+            ),
         ]),
 
         dcc.Download(id='download-references'),
+        dcc.Download(id='download-pdf'),
     ])

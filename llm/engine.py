@@ -725,33 +725,49 @@ class AtelierAIEngine:
 
     def followup_chat(self, query: str, current_topic: str, processed_records: List[Any]) -> dict:
         """
-        Intent Router: Evaluates if a follow-up requires new external documents or 
-        if it can be answered entirely within the current context scope.
-        
+        Intent Router: Evaluates whether a follow-up needs new external
+        documents (SEARCH), can be answered directly from what's already
+        loaded (CHAT), or needs active multi-step digging into the
+        existing papers - comparing them, reading full text, asking a
+        targeted question of one specific paper - without necessarily
+        needing a whole new search (INVESTIGATE).
+
         Args:
             query (str): The user's new question.
             current_topic (str): The overarching timeline topic.
             processed_records (List[Any]): Papers currently loaded in the feed view.
-            
+
         Returns:
-            dict: JSON containing 'intent' (SEARCH/CHAT) and an optimal 'standalone_query'.
+            dict: JSON containing 'intent' (SEARCH/CHAT/INVESTIGATE) and an
+                optimal 'standalone_query' (SEARCH only).
         """
         sys_prompt = """You are an intelligent routing agent for an academic research engine.
 
-            Task 1: Evaluate if the user's query can be confidently answered using ONLY the provided literature context.
-            - Judge this from each paper's takeaway below, not just its title - a paper whose title
-              doesn't mention the follow-up's subject may still directly address it (e.g. a title about
-              "screening determinants" whose takeaway discusses income/employment).
-            - If YES, route to 'CHAT'.
-            - If NO (asking about a new demographic, population, or question the context doesn't touch), route to 'SEARCH'.
-            - Default to CHAT when genuinely unsure: a wrong CHAT just gives a slightly incomplete answer
-              from existing papers, while a wrong SEARCH throws away that context and makes the user wait
-              through a full new search unnecessarily.
+            Task 1: Classify the user's follow-up into exactly one of three routes:
+
+            - 'CHAT': A direct question answerable in one pass from the existing papers' takeaways -
+              a summary, a specific fact, a simple comparison already visible at a glance.
+            - 'INVESTIGATE': Needs active, multi-step digging into the EXISTING papers to answer well -
+              e.g. "compare how paper 3 and 7 measured X", "what does the full text of the review say about Y",
+              "which of these papers actually addresses Z in depth". The papers likely already cover this,
+              but answering it well takes more than one read-through of the takeaways.
+            - 'SEARCH': The existing papers don't cover this at all - a new demographic, population, or
+              question genuinely outside what's already been gathered.
+
+            Judge from each paper's takeaway below, not just its title - a paper whose title doesn't
+            mention the follow-up's subject may still directly address it (e.g. a title about "screening
+            determinants" whose takeaway discusses income/employment).
+
+            Default to CHAT when genuinely unsure between CHAT and INVESTIGATE (INVESTIGATE costs more time
+            for marginal benefit on a question CHAT could already answer). Default to INVESTIGATE over SEARCH
+            when unsure whether the existing papers cover it (SEARCH throws away existing context and makes
+            the user wait through a whole new search; INVESTIGATE can still fall back to searching if it
+            turns out to be needed, but tries the cheaper path first).
 
             Task 2: If SEARCH, combine the original topic and the follow-up into a single standalone search query.
 
             Return ONLY a valid JSON object matching this exact schema:
-            {{"intent": "SEARCH" or "CHAT", "standalone_query": "merged query here or null"}}
+            {{"intent": "SEARCH" or "CHAT" or "INVESTIGATE", "standalone_query": "merged query here or null"}}
             """
 
         # Includes each paper's one-line takeaway (not just its title) so the

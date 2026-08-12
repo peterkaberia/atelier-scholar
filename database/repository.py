@@ -17,11 +17,22 @@ from sqlalchemy import select, update, delete, func, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from core.secrets import decrypt, encrypt
+from search.sparse_encoder import sparse_batch_dot
 
 from .database import engine, get_db_session
 from .models import Base, QueryCitation, QueryModel, SessionModel, PaperModel, PaperChunk, PaperSummaryModel, SessionPaperLink, Record, SettingModel
 
 logger = logging.getLogger(__name__)
+
+# In-process cache of (chunk_text, sparse_vector) pairs per paper
+# fingerprint - see AtelierRepository._get_cached_chunks. Deliberately just
+# a plain module-level dict with no TTL/eviction: DiskcacheManager (see
+# ui/callbacks/background.py) spawns a fresh OS process per background job
+# on Windows, so this cache's lifetime is naturally bounded to one job's
+# run - it can't grow stale across requests or leak memory across runs,
+# since the whole process (and this dict with it) is thrown away when the
+# job finishes.
+_CHUNK_CACHE: Dict[str, List[tuple]] = {}
 
 
 class AtelierRepository:
@@ -394,11 +405,47 @@ class AtelierRepository:
                     duration=row.duration,
                     country=row.country,
                     is_relevant=row.is_relevant,
-
                     _db_id=row.id,
                 )
                 out.append(rec)
 
+            return out
+
+    @staticmethod
+    def get_session_processed_papers(session_id: str, limit: int = 30) -> List[Record]:
+        """
+        Returns papers already EXTRACTED for this session (answer != "-"),
+        ordered by relevance - the mirror image of
+        get_top_unprocessed_records, which deliberately looks for papers
+        NOT yet extracted. Used by the investigation agent's
+        list_session_papers tool: "what's already known" needs the papers
+        that already have real findings attached, not the ranked-but-
+        unexamined candidate pool.
+        """
+        with get_db_session() as db:
+            rows = db.execute(
+                select(PaperModel, SessionPaperLink.relevance_score)
+                .join(SessionPaperLink, PaperModel.fingerprint == SessionPaperLink.paper_fingerprint)
+                .where(SessionPaperLink.session_id == session_id)
+                .where(PaperModel.answer.is_not(None))
+                .where(PaperModel.answer != "-")
+                .order_by(SessionPaperLink.relevance_score.desc())
+                .limit(limit)
+            ).all()
+
+            out = []
+            for row, _relevance_score in rows:
+                rec = Record(
+                    fingerprint=row.fingerprint, title=row.title, abstract=row.abstract,
+                    year=row.year, journal=row.journal, doi=row.doi, pmid=row.pmid,
+                    pmcid=row.pmcid, pdf_url=row.pdf_url, full_text_url=row.full_text_url,
+                    authors=row.authors, citation_count=row.citation_count,
+                    answer=row.answer, population=row.population, methods=row.methods,
+                    results=row.results, outcomes=row.outcomes, sample_size=row.sample_size,
+                    duration=row.duration, country=row.country, is_relevant=row.is_relevant,
+                    _db_id=row.id,
+                )
+                out.append(rec)
             return out
 
     @staticmethod
@@ -548,21 +595,47 @@ class AtelierRepository:
         sparse dot-product (same scoring approach as search_papers_by_vector)
         and returns the top-k passages, in relevance order.
         """
+        chunks = AtelierRepository._get_cached_chunks(fingerprint)
+        if not chunks:
+            return []
+
+        scores = sparse_batch_dot(query_vector, [c[1] for c in chunks])
+        scored = list(zip(scores, [c[0] for c in chunks]))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [text for _, text in scored[:top_k]]
+
+    @staticmethod
+    def get_all_chunk_texts(fingerprint: str) -> List[str]:
+        """
+        Returns every stored chunk's text for a paper, in storage order (not
+        scored/ranked against any query) - used by pipeline.agent_tools to
+        reconstruct something close to a paper's full text from its already-
+        chunked/persisted form, without re-fetching the source document.
+        """
+        return [text for text, _ in AtelierRepository._get_cached_chunks(fingerprint)]
+
+    @staticmethod
+    def _get_cached_chunks(fingerprint: str) -> List[tuple]:
+        """
+        Returns [(chunk_text, sparse_vector_dict), ...] for one paper,
+        cached in-process (see _CHUNK_CACHE's module-level docstring) so
+        repeated calls for the SAME paper within one run - e.g. an
+        investigation agent calling get_top_chunks_for_paper several times
+        while digging into one paper - skip the DB round-trip + JSON decode
+        after the first call.
+        """
+        cached = _CHUNK_CACHE.get(fingerprint)
+        if cached is not None:
+            return cached
+
         with get_db_session() as db:
             chunks = db.execute(
                 select(PaperChunk).where(PaperChunk.paper_fingerprint == fingerprint)
             ).scalars().all()
-            if not chunks:
-                return []
+            result = [(c.text, c.sparse_vector or {}) for c in chunks]
 
-            scored = []
-            for chunk in chunks:
-                vec = chunk.sparse_vector or {}
-                score = sum(weight * vec.get(token, 0) for token, weight in query_vector.items())
-                scored.append((score, chunk.text))
-
-            scored.sort(key=lambda pair: pair[0], reverse=True)
-            return [text for _, text in scored[:top_k]]
+        _CHUNK_CACHE[fingerprint] = result
+        return result
 
     # ==========================================
     # 6. VECTOR SEARCH CLIENT
@@ -602,15 +675,17 @@ class AtelierRepository:
 
             elif isinstance(query_data, dict):
                 # --- ADVANCED: Sparse Vector Dot-Product Search ---
+                # Batched, not one dot product per paper - this scans EVERY
+                # paper in the local DB with a stored vector, potentially
+                # the largest-scale case of the three sparse_batch_dot call
+                # sites - see its docstring.
                 rows = db.execute(
                     select(PaperModel).where(PaperModel.sparse_vector.is_not(None))
                 ).scalars().all()
-                for paper in rows:
-                    paper_vec = paper.sparse_vector
-                    score = sum(weight * paper_vec.get(token, 0) for token, weight in query_data.items())
-
+                scores = sparse_batch_dot(query_data, [row.sparse_vector for row in rows])
+                for row, score in zip(rows, scores):
                     if score > 0.5:
-                        scored_papers.append((score, paper))
+                        scored_papers.append((score, row))
 
             # Sort by highest score
             scored_papers.sort(key=lambda x: x[0], reverse=True)
@@ -756,17 +831,22 @@ class AtelierRepository:
     def get_query_by_id(query_id: int) -> Optional[Dict[str, Any]]:
         """
         Fetches a single query row's own fields - used by
-        ui/callbacks/library.py's load_more, which only receives a
-        query_id from its pattern-matching Input and needs the session_id/
-        original prompt/model_used it was generated with to run more
-        extraction the same way the initial search did.
+        ui/callbacks/library.py's load_more (session_id/prompt/model_used,
+        to run more extraction the same way the initial search did) and
+        export_pdf (also needs synthesis - the actual answer text - to
+        render a per-turn PDF).
         """
         try:
             with get_db_session() as db:
                 q = db.get(QueryModel, query_id)
                 if q is None:
                     return None
-                return {"session_id": q.session_id, "prompt": q.prompt, "model_used": q.model_used}
+                return {
+                    "session_id": q.session_id,
+                    "prompt": q.prompt,
+                    "model_used": q.model_used,
+                    "synthesis": q.synthesis,
+                }
         except Exception as e:
             logger.error(f"Failed to fetch query {query_id}: {e}")
             return None

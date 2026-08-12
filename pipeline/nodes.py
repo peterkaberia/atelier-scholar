@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, Optional
 from langchain_core.runnables import RunnableConfig
 
 from core.config import DEFAULT_SPARSE_MODEL
-from core.utils import chunk_text, truncate
+from core.utils import chunk_text, extract_keywords, truncate
 from database import AtelierRepository
 from llm.engine import AtelierAIEngine
 from search import AtelierAcademicSearch
@@ -116,20 +116,49 @@ def execute_search_node(state: ResearchState, config: Optional[RunnableConfig] =
 
 def broaden_query_node(state: ResearchState) -> Dict[str, Any]:
     """
-    Fallback handler: relaxes the boolean/field-tagged query plan down to the
-    raw topic string across every engine, to widen recall.
+    Fallback handler: relaxes the boolean/field-tagged query plan to widen
+    recall after the LLM's structured plan returned zero candidates across
+    every engine (usually because it produced an invalid/nonexistent MeSH
+    descriptor or malformed field-tag syntax - a real risk with smaller/
+    local models, which don't reliably know NLM's exact controlled
+    vocabulary the way a large hosted model does).
+
+    OpenAlex/Semantic Scholar/Crossref/arXiv are plain relevance-ranked
+    keyword search with no special syntax to get wrong, so the raw topic
+    sentence works fine for them as-is. PubMed and Europe PMC are NOT -
+    dropping them to the SAME raw, untagged sentence (confirmed live: a
+    topic with a typo returned 0 PubMed results and only 2 from Europe PMC,
+    while the other four engines returned dozens) hands their parsers an
+    unstructured phrase, and PubMed's Automatic Term Mapping in particular
+    can fail outright on a phrase that doesn't cleanly match rather than
+    gracefully degrading. Building an explicit OR-of-keywords[tiab]/
+    TITLE:/ABSTRACT: query instead (via core.utils.extract_keywords) keeps
+    them field-tagged and predictable - no MeSH-exact-match requirement
+    (the thing that just failed), and OR rather than AND means one bad
+    keyword (a typo, an odd word choice) can't zero out the whole query the
+    same way one bad MeSH term just did.
     """
     fallback = state["topic"]
+    keywords = extract_keywords(fallback)
+
+    # OR, not AND: this is the LAST-RESORT recall-widening step, and a
+    # single bad keyword (a typo, an odd word choice) inside an AND chain
+    # zeroes out the entire query just like the MeSH mismatch that got us
+    # here in the first place - confirmed live against PubMed's real API
+    # with a genuinely typo'd topic. OR only needs ONE keyword to match.
+    pubmed_fallback = " OR ".join(f'"{kw}"[tiab]' for kw in keywords) if keywords else fallback
+    europe_pmc_fallback = " OR ".join(f'(TITLE:"{kw}" OR ABSTRACT:"{kw}")' for kw in keywords) if keywords else fallback
+
     plan = {
-        "pubmed_query": fallback,
-        "europe_pmc_query": fallback,
+        "pubmed_query": pubmed_fallback,
+        "europe_pmc_query": europe_pmc_fallback,
         "openalex_query": fallback,
         "semantic_scholar_query": fallback,
         "crossref_query": fallback,
         "arxiv_query": fallback,
     }
     next_retry = state.get("retry_count", 0) + 1
-    logger.warning(f"Broadening query to raw topic (retry {next_retry}/{MAX_RETRIES}): '{fallback}'")
+    logger.warning(f"Broadening query (retry {next_retry}/{MAX_RETRIES}): pubmed='{pubmed_fallback}', europe_pmc='{europe_pmc_fallback}', others='{fallback}'")
     return {
         "query_plan": plan,
         "retry_count": next_retry,

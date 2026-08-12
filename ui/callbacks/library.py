@@ -4,6 +4,7 @@ import dash
 from dash import ALL, MATCH, Input, Output, State, callback, dcc, html, no_update
 
 from core.export import build_bibtex, build_ris
+from core.pdf_export import build_turn_pdf
 from database.repository import AtelierRepository
 from llm import AtelierAIEngine
 from llm.utils import get_model_choices
@@ -359,3 +360,42 @@ def summarize_selected_paper(checkbox_values, detail_clicks):
     selected_llm = last_used_model if last_used_model in available_models else (available_models[0] if available_models else None)
 
     return _build_paper_detail_content(record, topic, selected_llm, session_id, fingerprint)
+
+
+@callback(
+    Output('download-pdf', 'data'),
+    Input({'type': 'download-pdf-btn', 'query_id': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def export_pdf(n_clicks_list):
+    """
+    Downloads one turn (a synthesis, chat reply, or investigation answer -
+    whatever query_id refers to) as a standalone, well-formatted PDF - see
+    core.pdf_export.build_turn_pdf. Always sourced fresh from the DB by
+    query_id, same as export_references, so it works identically for a
+    just-generated turn and a historical one reloaded from disk.
+    """
+    triggered = dash.callback_context.triggered_id
+    trigger_value = dash.callback_context.triggered[0]['value'] if dash.callback_context.triggered else None
+    if not triggered or not isinstance(triggered, dict) or not trigger_value:
+        raise dash.exceptions.PreventUpdate
+
+    try:
+        qid_int = int(triggered.get('query_id'))
+    except (TypeError, ValueError):
+        raise dash.exceptions.PreventUpdate
+
+    query_info = AtelierRepository.get_query_by_id(qid_int)
+    if not query_info:
+        raise dash.exceptions.PreventUpdate
+
+    records = AtelierRepository.get_query_citations(qid_int)
+    pdf_bytes = build_turn_pdf(
+        title=query_info["prompt"],
+        model_name=query_info["model_used"],
+        markdown_text=query_info["synthesis"],
+        records=records,
+    )
+
+    filename = f"atelier-{qid_int}.pdf"
+    return dcc.send_bytes(pdf_bytes, filename)

@@ -33,6 +33,21 @@ def _looks_like_chat_model(model_id: str) -> bool:
     return not any(hint in lower for hint in _NON_CHAT_HINTS)
 
 
+# Floor for a model to be usable here at all. The final synthesis prompt
+# (llm/engine.py's generate_copilot_synthesis) concatenates up to 20 papers'
+# structured extraction fields plus a full-text excerpt each
+# (SYNTHESIS_PASSAGE_BUDGET=400 chars/paper - pipeline/nodes.py) on top of
+# the batched-extraction and query-planning prompts elsewhere in the
+# pipeline - worst case that's several thousand prompt tokens before the
+# model has written a word of its own answer. Checked live against
+# OpenRouter's actual catalog (2026-08): the wide majority of real chat
+# models report 128K+, with only a handful of legacy models (old GPT-3.5-
+# turbo variants, older 8B/13B checkpoints) below 16K - so this floor
+# excludes exactly the models actually too small for Atelier's prompts,
+# not a meaningful chunk of the real catalog.
+MIN_CONTEXT_LENGTH = 16000
+
+
 def _cached(cache_key: str, fetch_fn: Callable[[], List[str]]) -> List[str]:
     now = time.monotonic()
     cached = _CACHE.get(cache_key)
@@ -90,11 +105,16 @@ def _fetch_google(api_key: str) -> List[str]:
     )
     resp.raise_for_status()
     models = resp.json().get("models", [])
-    # Names come back as "models/gemini-2.5-flash" - strip the prefix, and
-    # only keep ones that actually support chat generation.
+    # Names come back as "models/gemini-2.5-flash" - strip the prefix, only
+    # keep ones that actually support chat generation, and (see
+    # MIN_CONTEXT_LENGTH's docstring) drop anything too small for Atelier's
+    # prompts - Google's list response reports inputTokenLimit per model,
+    # unlike OpenAI/Anthropic/Groq's list endpoints which expose no capacity
+    # metadata at all, so this check only applies here and to OpenRouter.
     ids = [
         m["name"].split("/", 1)[-1] for m in models
         if "generateContent" in m.get("supportedGenerationMethods", [])
+        and m.get("inputTokenLimit", MIN_CONTEXT_LENGTH) >= MIN_CONTEXT_LENGTH
     ]
     return sorted(ids)
 
@@ -124,9 +144,26 @@ def _fetch_openrouter(_credential: str) -> List[str]:
     # OpenRouter's catalog is public - listing needs no key, only actually
     # invoking a model does. `_credential` is accepted for signature
     # consistency with the other fetchers but unused.
+    #
+    # Unlike the other providers, OpenRouter's /models response carries real
+    # capability metadata per model (architecture.output_modalities,
+    # context_length) instead of just an id - so filtering here is exact,
+    # not a name-substring guess like _looks_like_chat_model. Without this,
+    # the raw catalog includes plenty of genuinely non-chat entries (Lyria
+    # music generation, GPT Audio, Gemini image models...) that would
+    # otherwise sit in the dropdown as if they were usable for Atelier's
+    # text synthesis/extraction/chat calls and fail outright if picked.
+    # output_modalities == ["text"] is the "can chat" check: anything that
+    # ALSO emits audio/image isn't a plain text-chat model. context_length
+    # is the "has the required context" check - see MIN_CONTEXT_LENGTH.
     resp = requests.get("https://openrouter.ai/api/v1/models", timeout=8)
     resp.raise_for_status()
-    return sorted([m["id"] for m in resp.json().get("data", [])])
+    ids = [
+        m["id"] for m in resp.json().get("data", [])
+        if m.get("architecture", {}).get("output_modalities") == ["text"]
+        and m.get("context_length", 0) >= MIN_CONTEXT_LENGTH
+    ]
+    return sorted(ids)
 
 
 def _validate_openrouter(api_key: str) -> None:

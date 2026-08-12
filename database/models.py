@@ -23,6 +23,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, relationship
 
+from core.utils import normalize_url
+
 Base = declarative_base()
 
 
@@ -293,6 +295,15 @@ class Record:
     _db_id: Optional[int] = None
 
     raw: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Every Record, regardless of which fetcher (search/paper.py) or DB
+        # reconstruction path built it, gets its links passed through
+        # normalize_url - see that function's docstring for why a
+        # scheme-less URL from an upstream API needs fixing up here rather
+        # than wherever it's eventually rendered.
+        self.pdf_url = normalize_url(self.pdf_url)
+        self.full_text_url = normalize_url(self.full_text_url)
 
     def to_model_dict(self) -> dict[str, Any]:
         """Shape aligned to your PaperModel fields."""

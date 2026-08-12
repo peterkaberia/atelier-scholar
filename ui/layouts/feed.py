@@ -229,13 +229,22 @@ def build_flow_header(query: str, model_name: str, ref_text: str, query_id=None)
     query_id (optional): when given, wraps the reference-count span in a
     pattern-matching id so ui/callbacks/library.py's load_more callback can
     update the visible count live after adding more papers, instead of it
-    staying stale until the next full page reload. Omitted for chat
-    follow-ups (they never render a paper-cards/load-more section at all -
-    see run_chat's docstring in ui/callbacks/chat.py).
+    staying stale until the next full page reload. Also gates the "Download
+    PDF" button (ui/callbacks/library.py's export_pdf) - both need a real
+    saved QueryModel row to work from, so both are simply absent if a save
+    ever failed and no id came back (rare, but see save_query_with_citations's
+    docstring - None is a real possible return).
     """
     ref_span = html.Span(ref_text, className="text-[11px] font-extrabold text-slate-500 uppercase tracking-widest")
+    pdf_button = None
     if query_id is not None:
         ref_span = html.Span(ref_text, id={'type': 'ref-count-text', 'query_id': str(query_id)}, className="text-[11px] font-extrabold text-slate-500 uppercase tracking-widest")
+        pdf_button = html.Button(
+            [html.Span("picture_as_pdf", className="material-symbols-outlined text-lg"), html.Span("Download PDF")],
+            id={'type': 'download-pdf-btn', 'query_id': str(query_id)},
+            n_clicks=0,
+            className="flex items-center space-x-2 text-[11px] font-extrabold text-slate-400 hover:text-primary uppercase tracking-widest transition-colors",
+        )
 
     return html.Section(className="py-12 px-4 md:px-12", children=[
         html.Div(className="max-w-3xl mx-auto", children=[
@@ -249,7 +258,8 @@ def build_flow_header(query: str, model_name: str, ref_text: str, query_id=None)
                     html.Div(className="flex items-center space-x-2", children=[
                         html.Span("description", className="material-symbols-outlined text-accent text-lg"),
                         ref_span,
-                    ])
+                    ]),
+                    pdf_button,
                 ])
             ])
         ])
@@ -442,8 +452,16 @@ def build_paper_cards(records: list, query_id=None, session_id: str = ""):
         html.Div(className="max-w-3xl mx-auto", children=[
             html.Div(className="space-y-8", children=[
                 html.Div(className="flex items-center justify-between border border-slate-200 p-2 rounded-2xl shadow-sm", children=[
-                    html.Div(className="flex items-center space-x-4 pl-4", children=[
-                        html.H2("Results", className="text-lg font-extrabold text-slate-900 tracking-tight")
+                    # Only THIS inner group is the click target for
+                    # collapsing/expanding (results-accordion-toggle, see
+                    # ui/layouts/main.py's index_string) - not the whole
+                    # header row, which also holds the export/view-mode
+                    # buttons on the right. A toggle spanning the full row
+                    # would fire on every button click too, and there's no
+                    # clean stopPropagation path from a plain Dash Button.
+                    html.Div(className="flex items-center space-x-4 pl-4 cursor-pointer select-none results-accordion-toggle", children=[
+                        html.Span("expand_more", className="material-symbols-outlined text-slate-400 accordion-chevron transition-transform duration-200"),
+                        html.H2("Results", className="text-lg font-extrabold text-slate-900 tracking-tight"),
                     ]),
                     html.Div(className="flex items-center gap-2", children=[
                         # Exports whatever's checked (all shown papers if
@@ -467,28 +485,36 @@ def build_paper_cards(records: list, query_id=None, session_id: str = ""):
                         ])
                     ])
                 ]),
-                filter_chips,
-                # class AND pattern-matching id: the class is for the
-                # filter-chip JS (main.py's index_string), scoped via
-                # closest() so it doesn't need a unique id. The id is for
-                # ui/callbacks/library.py's load_more callback, which DOES
-                # need to target this exact container's children with a
-                # Dash Output - a class alone can't be an Output target.
-                html.Div(
-                    id={'type': 'paper-cards-list', 'query_id': scope},
-                    className="space-y-0 divide-y divide-slate-200/40 paper-cards-list",
-                    children=articles,
-                ),
-                html.Div(className="pt-0 pb-4 flex flex-col items-center gap-2", children=[
-                    html.Button(
-                        "Load More Results",
-                        id={'type': 'load-more-btn', 'query_id': scope},
-                        n_clicks=0,
-                        className="px-8 py-3 bg-white border border-slate-200 rounded-full text-sm font-bold text-primary hover:border-primary hover:shadow-md transition-all",
+                # Collapsible body - rendered expanded by default (server
+                # side has no notion of "which flow-block is active"; that's
+                # purely a client-side, per-page-load concept). JS
+                # (ui/layouts/main.py's index_string, enforceActiveFlowBlock)
+                # collapses every flow-block's body except the LAST one on
+                # the page whenever a new turn is appended, and a click on
+                # results-accordion-toggle above flips it manually.
+                html.Div(className="results-accordion-body", children=[
+                    filter_chips,
+                    # class AND pattern-matching id: the class is for the
+                    # filter-chip JS (main.py's index_string), scoped via
+                    # closest() so it doesn't need a unique id. The id is for
+                    # ui/callbacks/library.py's load_more callback, which DOES
+                    # need to target this exact container's children with a
+                    # Dash Output - a class alone can't be an Output target.
+                    html.Div(
+                        id={'type': 'paper-cards-list', 'query_id': scope},
+                        className="space-y-0 divide-y divide-slate-200/40 paper-cards-list",
+                        children=articles,
                     ),
-                    html.Div(id={'type': 'load-more-status', 'query_id': scope}, className="text-xs font-semibold text-slate-400"),
-                ])
-
+                    html.Div(className="pt-0 pb-4 flex flex-col items-center gap-2", children=[
+                        html.Button(
+                            "Load More Results",
+                            id={'type': 'load-more-btn', 'query_id': scope},
+                            n_clicks=0,
+                            className="px-8 py-3 bg-white border border-slate-200 rounded-full text-sm font-bold text-primary hover:border-primary hover:shadow-md transition-all",
+                        ),
+                        html.Div(id={'type': 'load-more-status', 'query_id': scope}, className="text-xs font-semibold text-slate-400"),
+                    ]),
+                ]),
             ])
         ])
     ])

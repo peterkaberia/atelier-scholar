@@ -3,6 +3,8 @@ import logging
 from functools import lru_cache
 from typing import Dict, List
 
+import numpy as np
+
 try:
     from sentence_transformers import SparseEncoder
 except ImportError:
@@ -10,7 +12,7 @@ except ImportError:
 
 from core.config import STUDY_TYPE_WEIGHTS
 from core.utils import normalize_space, citation_bonus, year_bonus, classify_study_type
-from database import Record
+from database.models import Record
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +39,51 @@ def get_sparse_encoder(model_name: str):
 # ==========================================
 
 def _sparse_dot(query_dict: Dict[str, float], doc_dict: Dict[str, float]) -> float:
-    """Cheap pure-Python sparse dot-product - same approach already used by
-    AtelierRepository.search_papers_by_vector/get_top_chunks_for_paper."""
+    """Cheap pure-Python sparse dot-product - a single query-vs-single-doc
+    comparison. For scoring MANY docs against one query, use
+    sparse_batch_dot instead - see its docstring for why."""
     return sum(weight * doc_dict.get(token, 0) for token, weight in query_dict.items())
+
+
+def sparse_batch_dot(query_dict: Dict[str, float], doc_dicts: List[Dict[str, float]]) -> List[float]:
+    """
+    Scores MANY documents against one SPLADE query vector in a single
+    vectorized numpy operation, instead of len(doc_dicts) separate
+    Python-level dict-iteration dot products (the previous approach,
+    still used by _sparse_dot for genuine one-off comparisons). Used
+    anywhere a query gets compared against a whole batch at once -
+    AtelierRepository.search_papers_by_vector (every cached paper in the
+    local DB), .get_top_chunks_for_paper (every chunk of one paper), and
+    compute_scores's cached-paper branch.
+
+    Builds a LOCAL token->index map from just the query's own tokens (not
+    the full ~30K SPLADE vocab) - a document's tokens that aren't in the
+    query can never contribute to its dot product against that query, so
+    there's no need to index them. That keeps the matrix small (bounded by
+    however many tokens the query itself has, typically a few dozen)
+    regardless of how large the underlying SPLADE vocabulary is.
+
+    Returns a plain list of floats, same order as doc_dicts, so callers
+    don't need to know this is numpy under the hood.
+    """
+    if not doc_dicts:
+        return []
+    if not query_dict:
+        return [0.0] * len(doc_dicts)
+
+    vocab = {token: i for i, token in enumerate(query_dict.keys())}
+    query_vec = np.zeros(len(vocab), dtype=np.float32)
+    for token, weight in query_dict.items():
+        query_vec[vocab[token]] = weight
+
+    doc_matrix = np.zeros((len(doc_dicts), len(vocab)), dtype=np.float32)
+    for i, doc_dict in enumerate(doc_dicts):
+        for token, weight in (doc_dict or {}).items():
+            idx = vocab.get(token)
+            if idx is not None:
+                doc_matrix[i, idx] = weight
+
+    return (doc_matrix @ query_vec).tolist()
 
 
 def compute_scores(records: List[Record], topic: str, model_name: str) -> None:
@@ -66,8 +110,14 @@ def compute_scores(records: List[Record], topic: str, model_name: str) -> None:
         to_embed = [r for r in records if not r.sparse_vector]
         cached = [r for r in records if r.sparse_vector]
 
-        for rec in cached:
-            rec.sparse_score = round(_sparse_dot(query_dict, rec.sparse_vector), 6)
+        # Batched, not one _sparse_dot call per paper - see
+        # sparse_batch_dot's docstring. Matters most here since a search
+        # that heavily overlaps prior ones can have most of its candidate
+        # pool land in `cached`.
+        if cached:
+            scores = sparse_batch_dot(query_dict, [r.sparse_vector for r in cached])
+            for rec, score in zip(cached, scores):
+                rec.sparse_score = round(score, 6)
 
         if to_embed:
             docs = [normalize_space(f"{r.title}\n{r.abstract}") for r in to_embed]
@@ -127,8 +177,17 @@ def encode_chunks(chunks: List[str], model_name: str, top_k: int = 128) -> List[
     return [dict(pairs) for pairs in decoded]
 
 
+@lru_cache(maxsize=256)
 def encode_query_sparse(query: str, model_name: str) -> Dict[str, float]:
-    """Encodes a single query string into a SPLADE sparse dict for chunk scoring."""
+    """
+    Encodes a single query string into a SPLADE sparse dict for chunk
+    scoring. Cached (same pattern as get_sparse_encoder above) - an
+    investigation agent calling this repeatedly with overlapping/identical
+    queries during one run shouldn't pay for a fresh neural forward pass
+    each time. Safe to cache despite returning a dict: every caller
+    (compute_scores, sparse_batch_dot, get_top_chunks_for_paper,
+    search_papers_by_vector) only reads it, never mutates it in place.
+    """
     model = get_sparse_encoder(model_name)
     query_vector = model.encode_query([query])  # 2D tensor: (1, vocab_size)
     decoded = model.decode(query_vector, top_k=None)  # list[list[(token, weight)]], one entry

@@ -1,10 +1,46 @@
 import math
 import re
-from typing import Optional, Any, List
+from typing import Any, List, Optional, Tuple
 
 def normalize_space(text: str) -> str:
     """Removes extra whitespace and newlines from a string."""
     return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+# Generic English function words plus a few research-phrasing filler words
+# ("factors", "affecting", "role", "impact"...) that carry no topical
+# meaning on their own - stripped so pipeline.nodes.broaden_query_node's
+# keyword fallback ANDs together only the actual subject-matter terms.
+_QUERY_STOPWORDS = {
+    "a", "an", "the", "of", "in", "on", "for", "and", "or", "to", "with", "is", "are", "was", "were",
+    "this", "that", "these", "those", "by", "at", "as", "it", "its", "be", "been", "being", "from",
+    "does", "do", "did", "can", "could", "should", "would", "will", "shall", "has", "have", "had",
+    "affecting", "affect", "affects", "factors", "factor", "related", "regarding", "about", "among",
+    "role", "impact", "effect", "effects", "between", "into", "what", "how", "why", "which",
+}
+
+
+def extract_keywords(text: str, min_len: int = 3) -> List[str]:
+    """
+    Strips stopwords/punctuation from a natural-language query, returning
+    the remaining significant keyword tokens in their original order
+    (duplicates removed) - used by pipeline.nodes.broaden_query_node to
+    build a field-tagged fallback query for PubMed/Europe PMC instead of
+    sending them an untagged raw sentence (see that function's docstring
+    for why: their parsers handle a bag of tagged keywords far more
+    reliably than a whole phrase, especially one with a typo or unusual
+    phrasing that trips up phrase-matching heuristics).
+    """
+    words = re.findall(r"[a-zA-Z][a-zA-Z\-]*", text or "")
+    seen = set()
+    out = []
+    for w in words:
+        lw = w.lower()
+        if len(lw) < min_len or lw in _QUERY_STOPWORDS or lw in seen:
+            continue
+        seen.add(lw)
+        out.append(lw)
+    return out
 
 
 def doi_key(doi: str) -> str:
@@ -166,6 +202,46 @@ def clean_text(value: Any) -> Optional[str]:
     text = str(value).strip()
     return text or None
 
+_ABSOLUTE_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+def normalize_url(url: Optional[str]) -> Optional[str]:
+    """
+    Normalizes a pdf_url/full_text_url pulled from an external API (Europe
+    PMC, OpenAlex, Semantic Scholar, Crossref, arXiv - search/paper.py) into
+    something a browser can actually resolve. Called from
+    database.models.Record.__post_init__ so every Record gets this
+    regardless of which fetcher built it.
+
+    Some upstream APIs occasionally hand back a URL missing its scheme -
+    a protocol-relative "//host/paper.pdf" or a bare "example.com/paper.pdf".
+    Passed straight through to an <a href> or the in-app PDF viewer's
+    `iframe.src = url` (ui/layouts/main.py's index_string), either resolves
+    against the CURRENT page's own origin instead of the intended host,
+    producing a link that looks plausible but 404s or silently never loads -
+    confirmed as a distinct failure mode from the already-expected
+    403/404s publishers return for a genuinely correct, reachable URL.
+    Recovers a scheme when one is clearly recoverable; otherwise discards
+    the value entirely (None) so the UI falls back to its normal "no PDF
+    available" state instead of showing a link that's guaranteed to fail.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    if _ABSOLUTE_URL_RE.match(url):
+        return url
+    if url.startswith("//"):
+        return f"https:{url}"
+    # A bare domain-like string ("example.com/paper.pdf", "www.example.com")
+    # - a dot in the part before the first slash, and no whitespace, reads
+    # as a host that just lost its scheme rather than an already-broken
+    # path fragment.
+    head = url.split("/", 1)[0]
+    if "." in head and " " not in url:
+        return f"https://{url}"
+    return None
+
 def nested_get(obj: Any, *path: str) -> Any:
     cur = obj
     for key in path:
@@ -231,4 +307,73 @@ def split_author_string(author_string: Optional[str]) -> list[str]:
     if not author_string:
         return []
     return [part.strip() for part in author_string.split(",") if part.strip()]
+
+
+def order_citations_by_appearance(text: str, candidates: List[Tuple[str, Any]]) -> Tuple[str, List[Any]]:
+    """
+    Renumbers a text's [marker] citations so [1] is whichever candidate is
+    FIRST cited reading top-to-bottom, [2] is the next NEW one encountered,
+    and so on - instead of whatever order the candidates were pre-assigned
+    in before the text was even written.
+
+    Why this matters: generate_copilot_synthesis/chat_with_literature both
+    pre-assign [1]/[2]/... to valid_records in RELEVANCE-SCORE order before
+    the LLM writes a word, and the LLM cites using those pre-assigned
+    numbers - so a synthesis routinely cites [4] before [1] simply because
+    the 4th-most-relevant paper happened to fit better into the opening
+    sentence. Confirmed live and reported directly: readers expect [1] to
+    be whatever's cited first, not "whatever scored highest." Called on
+    each turn's own output independently (not any shared session-wide
+    order), so two turns citing an overlapping paper can freely give it
+    different numbers, matching THEIR OWN reading order.
+
+    Args:
+        text: the raw output containing "[marker]" citations - marker is
+            whatever string was used when the text was generated (a
+            1-based index like "1", "2", ... for generate_copilot_synthesis
+            /chat_with_literature, or a paper fingerprint like
+            "doi:10.1234/xyz" for the investigation agent - anything that
+            appears literally as "[marker]" in the text works).
+        candidates: [(marker, record), ...] in whatever order they were
+            available in (NOT necessarily citation order) - every record
+            actually cited in `text` gets kept; anything not cited is
+            dropped, same "only truly-cited papers get attached" behavior
+            the callers already relied on before this renumbering existed.
+
+    Returns:
+        (rewritten_text, ordered_records): rewritten_text has every
+        [marker] replaced with its new 1-based position; ordered_records
+        is in that SAME new order, so ordered_records[i] is exactly what
+        [i+1] refers to in rewritten_text - callers can pass this directly
+        wherever a synthesis's valid_records/citations are expected.
+    """
+    first_seen = []
+    for marker, record in candidates:
+        idx = text.find(f"[{marker}]")
+        if idx != -1:
+            first_seen.append((idx, marker, record))
+    first_seen.sort(key=lambda entry: entry[0])
+
+    if not first_seen:
+        return text, []
+
+    marker_to_new = {}
+    ordered_records = []
+    for new_num, (_, old_marker, record) in enumerate(first_seen, start=1):
+        # A marker could legitimately map to more than one candidate only
+        # if callers pass duplicates - first one wins, matching dict
+        # insertion behavior generally expected here.
+        marker_to_new.setdefault(old_marker, new_num)
+        ordered_records.append(record)
+
+    # Single regex pass, not sequential .replace() calls: renumbering
+    # routinely produces overlapping old/new numbers (e.g. old [2] -> new
+    # [1] while old [1] -> new [2]), and replacing them one at a time risks
+    # a second replace() matching text a PRIOR replace() just inserted,
+    # silently corrupting the result. re.sub with a lookup callback applies
+    # every substitution against the ORIGINAL text in one pass instead.
+    pattern = re.compile(r"\[(" + "|".join(re.escape(m) for m in marker_to_new.keys()) + r")\]")
+    rewritten = pattern.sub(lambda m: f"[{marker_to_new[m.group(1)]}]", text)
+
+    return rewritten, ordered_records
 

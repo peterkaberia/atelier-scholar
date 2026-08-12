@@ -15,6 +15,7 @@ dependencies = [
     "langchain-openai",
     "langgraph",
     "langgraph-checkpoint-sqlite>=3.1.1",
+    "markdown>=3.10.3",
     "numpy",
     "pandas",
     "pypdf",
@@ -25,6 +26,7 @@ dependencies = [
     "tenacity",
     "torch",
     "torchvision",
+    "xhtml2pdf>=0.2.17",
 ]
 
 [tool.uv]
