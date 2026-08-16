@@ -4,7 +4,7 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/damurka/atelier/blob/main/atelier-demo.ipynb)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)]()
+[![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)]()
 [![Dash](https://img.shields.io/badge/UI-Plotly_Dash-informational.svg)]()
 
 **Atelier** takes a natural-language research question, plans engine-specific boolean queries with an LLM, concurrently searches six academic databases, ranks candidates with a local sparse-vector model weighted by citation count and study design, extracts structured per-paper metadata, and writes a fully cited, abstract-style synthesis — all through a reactive Dash single-page app with a resumable, checkpointed pipeline underneath.
@@ -16,18 +16,23 @@
 * 📊 **Quality-Weighted Ranking:** Relevance scoring blends SPLADE sparse-vector similarity with citation count, recency, and a study-type evidence tier (systematic review > RCT > cohort > case report, etc.) - not just topical match.
 * 🧭 **Atelier Meter:** For yes/no-shaped research questions, a weighted agreement bar shows how the literature actually leans, with each paper's vote weighted by its evidence tier and citation count rather than counted equally.
 * ✍️ **Abstract-Style Synthesis:** Background → Evidence Synthesis → Key Findings → Conclusion, written in real academic-abstract prose that explicitly characterizes how strong and consistent the evidence is - not just a list of findings.
-* 💬 **Context-Aware Follow-Ups:** Ask questions, request a rewrite of your own pasted draft with citations woven in, or ask for a specific deliverable ("write a 300-word abstract", "write an introduction") - each handled with its own genre-appropriate prompt. Follow-ups first check papers your original search already found but didn't extract before falling back to a full new external search.
+* 💬 **Context-Aware Follow-Ups:** A router classifies each follow-up as a new SEARCH, a context-only CHAT, or an active INVESTIGATE - ask questions, request a rewrite of your own pasted draft with citations woven in, or ask for a specific deliverable ("write a 300-word abstract", "write an introduction") - each handled with its own genre-appropriate prompt. Follow-ups first check papers your original search already found but didn't extract before falling back to a full new external search.
+* 🕵️ **Deep-Dive Investigation Agent:** A LangGraph ReAct tool-calling agent for follow-ups that need active digging rather than just answering from what's already on screen - it can search for more papers, fetch a specific paper's full text, run a RAG search over already-fetched full-text chunks, and analyze multiple papers in parallel, citing exactly what it actually used. Falls back to plain context-aware chat if the agent itself fails.
 * 📄 **Per-Paper AI Summaries:** Click any paper for a topic-focused summary, its full author list, a link to the journal (via DOI), and an in-app PDF viewer - summaries are cached per session so re-opening a paper is instant.
 * 📥 **Reference Export:** Download citations as BibTeX or RIS, either the whole turn's reference list (selection-aware) or a single paper at a time - compatible with Zotero, EndNote, and Mendeley.
+* 📑 **PDF Export:** Download any turn - synthesis, investigation answer, or chat reply - as a formatted PDF with its full reference list, generated with no native rendering dependencies (pure-Python `markdown` + `xhtml2pdf`).
+* 🔢 **Appearance-Ordered Citations:** Each turn's `[N]` citation numbers are renumbered by where they actually first appear in that turn's own generated text, not by pre-assigned relevance rank - so numbering always reads top-to-bottom in-order, and overlapping papers across turns don't force the same numbering everywhere.
 * 🔄 **Load More:** Pull additional already-ranked candidates into an existing turn's evidence library on demand, without re-running the search.
-* 🎨 **Reactive Dash UI:** TailwindCSS-styled frontend with interactive citation hover-popups, study-type filter chips, live session status, and asynchronous background execution that survives page navigation.
+* 🎨 **Reactive Dash UI:** TailwindCSS-styled frontend with interactive citation hover-popups, study-type filter chips, a collapsible per-turn Evidence Library that auto-collapses older turns and keeps the active one in view, live session status, and asynchronous background execution that survives page navigation.
 * 🔐 **Encrypted, UI-Configurable Keys:** Add LLM and academic-API keys from the in-app Settings page - encrypted at rest, no restart required.
 
 ## 🛠️ Tech Stack
 
 * **Pipeline:** [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph` with a `SqliteSaver` checkpointer, keyed per session *and* per follow-up topic so genuinely different searches never replay stale results.
-* **Frontend:** Plotly Dash, TailwindCSS, custom clientside JavaScript (citation popovers, PDF viewer, filter chips)
+* **Investigation Agent:** LangGraph's `create_react_agent` (prebuilt ReAct loop) over a custom toolset (`pipeline/agent_tools.py`), checkpointed the same way as the main pipeline so a long investigation can resume mid-way.
+* **Frontend:** Plotly Dash, TailwindCSS, custom clientside JavaScript (citation popovers, PDF viewer, filter chips, results accordion + active-turn auto-scroll)
 * **Backend:** Python, SQLAlchemy ORM
+* **PDF Export:** `markdown` + `xhtml2pdf` (pure-Python, no native GTK/Pango/Cairo dependency)
 * **Database:** SQLite (WAL mode) - structured metadata, SPLADE sparse vectors, and full-text chunks for RAG-grounded extraction/synthesis
 * **Embeddings:** SPLADE sparse encoder (`sentence-transformers`) for relevance scoring and chunk-level retrieval
 * **LLM Providers:** Any OpenAI-compatible provider - OpenRouter, LM Studio (local), or others - configured per-request as `provider:model`
@@ -93,14 +98,16 @@ uv run python app.py
 1. Open your browser and navigate to http://localhost:8050.
 2. Type a research question into the search bar (e.g., ***"What are the socioeconomic barriers to breast cancer screening in sub-Saharan Africa?"***).
 3. Atelier plans the search, fetches papers from all six engines, ranks and extracts the most relevant ones, and generates a fully cited, abstract-style synthesis - plus an Atelier Meter if the question is yes/no-shaped.
-4. Ask follow-ups in the same thread: pointed questions, "rewrite this paragraph with the evidence," or "write me a 300-word abstract."
+4. Ask follow-ups in the same thread: pointed questions, "rewrite this paragraph with the evidence," "write me a 300-word abstract," or something that needs active digging ("find more papers on X and compare them") - Atelier routes each one to the right mode automatically.
+5. Download any turn as a PDF, or export its references as BibTeX/RIS, from that turn's header.
 
 ## 🏗️ Architecture Overview
 
-* `pipeline/`: The research workflow as a LangGraph `StateGraph` (`graph.py`/`nodes.py`), orchestrated by `orchestrator.py`. Checkpointed via SQLite so an interrupted or resumed run picks up from its last completed node.
+* `pipeline/`: The research workflow as a LangGraph `StateGraph` (`graph.py`/`nodes.py`), orchestrated by `orchestrator.py`. Checkpointed via SQLite so an interrupted or resumed run picks up from its last completed node. `agent.py`/`agent_tools.py` hold the separate ReAct investigation agent used for deep-dive follow-ups.
 * `search/`: Object-oriented API wrappers for all six engines (`paper.py`), a throttled/retrying `HttpClient`, and the SPLADE-based sparse-vector scorer (`sparse_encoder.py`).
 * `llm/`: The LLM engine - query planning, batched per-paper extraction, abstract-style synthesis, the Atelier Meter, conversational follow-ups, and per-paper summaries.
 * `database/`: SQLAlchemy models and a repository layer abstracting all persistence, including hybrid text/vector local recall and full chat history.
+* `core/`: Cross-cutting utilities - text/URL/citation normalization (`utils.py`), global logging setup (`logger.py`), encrypted key storage (`secrets.py`), and BibTeX/RIS/PDF export (`export.py`/`pdf_export.py`).
 * `ui/`: Dash layouts, Tailwind styling, and reactive callbacks - background jobs are gated through a session-aware store so a job for one session can never silently overwrite what a user has since navigated to in the same tab.
 * `docs/adr/`: Architecture decision records for the non-obvious design choices.
 
