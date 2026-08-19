@@ -10,7 +10,7 @@ on nearly every page render.
 
 import logging
 import time
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -34,18 +34,29 @@ def _looks_like_chat_model(model_id: str) -> bool:
 
 
 # Floor for a model to be usable here at all. The final synthesis prompt
-# (llm/engine.py's generate_copilot_synthesis) concatenates up to 20 papers'
-# structured extraction fields plus a full-text excerpt each
-# (SYNTHESIS_PASSAGE_BUDGET=400 chars/paper - pipeline/nodes.py) on top of
-# the batched-extraction and query-planning prompts elsewhere in the
-# pipeline - worst case that's several thousand prompt tokens before the
-# model has written a word of its own answer. Checked live against
-# OpenRouter's actual catalog (2026-08): the wide majority of real chat
-# models report 128K+, with only a handful of legacy models (old GPT-3.5-
-# turbo variants, older 8B/13B checkpoints) below 16K - so this floor
-# excludes exactly the models actually too small for Atelier's prompts,
-# not a meaningful chunk of the real catalog.
+# (llm/engine.py's chat_with_literature) concatenates up to 20 papers'
+# structured extraction fields plus a full-text excerpt each, on top of the
+# batched-extraction and query-planning prompts elsewhere in the pipeline -
+# worst case that's several thousand prompt tokens before the model has
+# written a word of its own answer. Checked live against OpenRouter's
+# actual catalog (2026-08): the wide majority of real chat models report
+# 128K+, with only a handful of legacy models (old GPT-3.5-turbo variants,
+# older 8B/13B checkpoints) below 16K - so this floor excludes exactly the
+# models actually too small for Atelier's prompts, not a meaningful chunk
+# of the real catalog.
 MIN_CONTEXT_LENGTH = 16000
+
+# Fallback context length (tokens) for any model whose provider's listing
+# endpoint reports no capacity metadata at all - OpenAI/Anthropic/Groq/
+# Ollama/LM Studio's /models endpoints expose only ids (see each fetcher's
+# docstring below), unlike OpenRouter/Google's, which is the only reason
+# get_model_context_length can be exact for those two and not the rest.
+# Deliberately conservative (this module's whole premise, per its own
+# docstring, is not hand-maintaining a per-model-name table that goes
+# stale) - guessing too LOW only costs unused headroom in the budget
+# functions below; guessing too HIGH risks an oversized-prompt API error
+# the provider itself would reject.
+DEFAULT_CONTEXT_LENGTH = 32000
 
 
 def _cached(cache_key: str, fetch_fn: Callable[[], List[str]]) -> List[str]:
@@ -237,6 +248,230 @@ def list_provider_models(provider: str, credential: str) -> List[str]:
 
     cache_key = f"{provider}:{credential}"
     return _cached(cache_key, lambda: fetch_fn(credential))
+
+
+# ==========================================
+# CONTEXT LENGTH LOOKUP
+# ==========================================
+#
+# Only OpenRouter and Google's /models responses carry real per-model
+# capacity metadata (context_length / inputTokenLimit - see
+# _fetch_openrouter/_fetch_google above); OpenAI/Anthropic/Groq/Ollama/LM
+# Studio's list endpoints expose none at all. These two fetchers mirror
+# _fetch_openrouter/_fetch_google exactly (same filtering) but return
+# {model_id: context_length} instead of discarding the number after
+# filtering - a second, parallel request rather than sharing _CACHE with
+# the id-only fetchers, since the two caches can independently expire and
+# there's no clean way to recover a discarded number from a cached List[str].
+
+_CONTEXT_CACHE: Dict[str, Tuple[float, Dict[str, int]]] = {}
+
+
+def _cached_context_lengths(cache_key: str, fetch_fn: Callable[[], Dict[str, int]]) -> Dict[str, int]:
+    now = time.monotonic()
+    cached = _CONTEXT_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
+        return cached[1]
+
+    try:
+        lengths = fetch_fn()
+        _CONTEXT_CACHE[cache_key] = (now, lengths)
+        return lengths
+    except Exception as e:
+        logger.warning(f"Context-length listing failed for '{cache_key}': {e}")
+        return cached[1] if cached else {}
+
+
+def _fetch_openrouter_context_lengths(_credential: str) -> Dict[str, int]:
+    resp = requests.get("https://openrouter.ai/api/v1/models", timeout=8)
+    resp.raise_for_status()
+    return {
+        m["id"]: m.get("context_length", 0)
+        for m in resp.json().get("data", [])
+        if m.get("architecture", {}).get("output_modalities") == ["text"]
+        and m.get("context_length", 0) >= MIN_CONTEXT_LENGTH
+    }
+
+
+def _fetch_google_context_lengths(api_key: str) -> Dict[str, int]:
+    resp = requests.get(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        params={"key": api_key}, timeout=8,
+    )
+    resp.raise_for_status()
+    out: Dict[str, int] = {}
+    for m in resp.json().get("models", []):
+        if "generateContent" not in m.get("supportedGenerationMethods", []):
+            continue
+        limit = m.get("inputTokenLimit", 0)
+        if limit < MIN_CONTEXT_LENGTH:
+            continue
+        out[m["name"].split("/", 1)[-1]] = limit
+    return out
+
+
+_CONTEXT_LENGTH_FETCHERS: Dict[str, Callable[[str], Dict[str, int]]] = {
+    "openrouter": _fetch_openrouter_context_lengths,
+    "google": _fetch_google_context_lengths,
+}
+
+
+def get_model_context_length(model_choice: Optional[str]) -> int:
+    """
+    Best-effort real context window (in tokens) for `model_choice`
+    ("provider:model", the same string threaded through everywhere as
+    AtelierAIEngine's model_choice). Falls back to DEFAULT_CONTEXT_LENGTH
+    for any provider without capacity metadata, an unrecognized/malformed
+    model_choice, or a failed lookup - see that constant's docstring for
+    why the fallback is conservative rather than a guessed table.
+
+    Used by the budget functions below to size how much paper content
+    Atelier feeds this model per call, instead of a single hardcoded
+    constant identical for an 8K local model and a 1M+-token model alike.
+    """
+    if not model_choice or ":" not in model_choice:
+        return DEFAULT_CONTEXT_LENGTH
+
+    provider, model_name = model_choice.split(":", 1)
+    fetch_fn = _CONTEXT_LENGTH_FETCHERS.get(provider)
+    if not fetch_fn:
+        return DEFAULT_CONTEXT_LENGTH
+
+    if provider == "google":
+        from core.config import resolve_key
+        credential = resolve_key("GOOGLE_API_KEY") or ""
+    else:
+        credential = ""  # OpenRouter's catalog is public - see _fetch_openrouter's docstring.
+
+    lengths = _cached_context_lengths(f"{provider}:{credential}", lambda: fetch_fn(credential))
+    return lengths.get(model_name, DEFAULT_CONTEXT_LENGTH)
+
+
+# ==========================================
+# CONTEXT-BUDGET SCALING
+# ==========================================
+#
+# Every content budget the pipeline feeds an LLM (how much of a paper's
+# text goes into extraction, how many full-text chunks get RAG-retrieved,
+# how much of a paper's excerpt survives into the final synthesis prompt)
+# used to be a single hardcoded constant, identical regardless of whether
+# the selected model had an 8K or a 2M-token window - a huge-context model
+# got exactly as much material as a small local one, wasting its real
+# capacity for no reason. These derive every such budget from
+# get_model_context_length instead, so a bigger-context model genuinely
+# gets more material to work with, and a smaller one still gets a budget
+# that fits.
+
+CHARS_PER_TOKEN = 4  # rough heuristic for English text
+
+# Reserved for system-prompt boilerplate + the model's own response,
+# regardless of context size - without this floor, a tiny-context model's
+# "available" budget could get divided down toward zero.
+RESERVED_OVERHEAD_TOKENS = 3000
+
+# Even a genuinely enormous window (Gemini's 1M-2M-token tier) doesn't get
+# UNLIMITED content - a single call stuffed with hundreds of thousands of
+# tokens of paper text would be extremely slow and expensive for a
+# marginal quality gain over "a lot more than before." This caps the POOL
+# every budget function below draws from, not any one of them individually.
+MAX_AVAILABLE_CONTENT_CHARS = 800_000  # ~200K tokens
+
+
+def _available_content_chars(model_choice: Optional[str]) -> int:
+    """Total characters of PAPER CONTENT `model_choice`'s context window can reasonably hold in one prompt, after reserving room for instructions and the model's own response."""
+    usable_tokens = max(get_model_context_length(model_choice) - RESERVED_OVERHEAD_TOKENS, 1000)
+    return min(usable_tokens * CHARS_PER_TOKEN, MAX_AVAILABLE_CONTENT_CHARS)
+
+
+def batch_extraction_content_budget(model_choice: Optional[str], batch_size: int) -> int:
+    """
+    Per-paper character budget when `batch_size` papers share one batched
+    extraction prompt (pipeline/nodes.py's extract_records) - the total
+    across the whole batch stays within _available_content_chars either
+    way, this just decides how that pool is split.
+    """
+    per_paper = _available_content_chars(model_choice) // max(batch_size, 1)
+    return max(min(per_paper, 200_000), 800)
+
+
+def synthesis_passage_budget(model_choice: Optional[str], paper_count: int) -> int:
+    """
+    Character budget for the short full-text excerpt (Record.top_passage)
+    carried into the FINAL synthesis/chat prompt per paper, when up to
+    `paper_count` papers' excerpts all share that ONE prompt together
+    (llm.engine._format_synthesis_entry, called once per paper but
+    concatenated into a single call).
+    """
+    per_paper = _available_content_chars(model_choice) // max(paper_count, 1)
+    return max(min(per_paper, 4000), 200)
+
+
+def full_text_tool_budget(model_choice: Optional[str]) -> int:
+    """
+    Character budget for a single tool observation
+    (pipeline/agent_tools.py's get_full_text) - that paper's text is alone
+    in its turn's context (not sharing a prompt with other papers the way
+    batched extraction does), so it gets a generous share of the pool.
+    """
+    return min(_available_content_chars(model_choice), 100_000)
+
+
+def chat_history_turn_count(model_choice: Optional[str]) -> int:
+    """
+    How many of the most recent chat_history messages get included in a
+    synthesis/chat/investigation prompt (llm.engine.chat_with_literature,
+    pipeline.agent.run_investigation) - each message can be a full prior
+    synthesis (thousands of characters), so a fixed "last 6" wastes a
+    big-context model's real capacity to actually remember the
+    conversation, the same way the other fixed content budgets did.
+
+    Deliberately NOT scaled off _available_content_chars/full_text_tool_
+    budget the way those are: chat history SHARES its one prompt with the
+    paper content those functions already size independently (see
+    synthesis_passage_budget), so greedily maxing this out too would
+    double-book the same context window instead of leaving it real room.
+    Tiered and conservative instead - a bigger-context model still
+    remembers meaningfully more than the old fixed 6, just with headroom
+    left over for the paper content sharing that same prompt.
+    """
+    context_length = get_model_context_length(model_choice)
+    if context_length >= 200_000:
+        return 20
+    if context_length >= 100_000:
+        return 12
+    if context_length >= 32_000:
+        return 6
+    return 4
+
+
+def rag_chunk_count(model_choice: Optional[str]) -> int:
+    """
+    How many top-scored full-text chunks (~1200 chars each - see
+    core.utils.chunk_text's default chunk_size) a single TARGETED RAG
+    query retrieves (pipeline/agent_tools.py's rag_search_chunks tool).
+
+    Scales modestly with context window, but with its own tight ceiling
+    rather than reusing full_text_tool_budget's - unlike a raw content
+    budget, a "targeted" retrieval should stay small even for a
+    huge-context model; past roughly 10 chunks it stops being a targeted
+    answer and starts being "read the whole paper," which get_full_text
+    already covers.
+    """
+    return max(3, min(10, get_model_context_length(model_choice) // 20_000))
+
+
+def session_paper_list_count(model_choice: Optional[str]) -> int:
+    """
+    How many of a session's already-processed papers
+    (pipeline/agent_tools.py's list_session_papers tool) get listed in one
+    call. Scales with context window so a large-context model
+    investigating a session with many accumulated papers (repeated
+    searches/investigations over time) can see more of them at once,
+    rather than the same fixed slice a small model would - each line is
+    compact (title + one-line takeaway), so even a generous count costs
+    relatively little of the budget.
+    """
+    return max(30, min(200, get_model_context_length(model_choice) // 1000))
 
 
 def validate_provider_credential(provider: str, credential: str) -> Tuple[bool, str]:

@@ -309,6 +309,15 @@ def split_author_string(author_string: Optional[str]) -> list[str]:
     return [part.strip() for part in author_string.split(",") if part.strip()]
 
 
+# Matches a grouped citation bracket like "[doi:A; doi:B]" or "[1, 2]" -
+# two or more marker-shaped tokens (a colon-delimited fingerprint, or a
+# bare digit) joined by a comma/semicolon inside ONE pair of brackets. See
+# order_citations_by_appearance's use of this for why it needs splitting
+# before that function's own exact-marker matching runs.
+_MULTI_MARKER_RE = re.compile(
+    r"\[((?:[a-zA-Z0-9]+:[^\];,\s]+|\d+)(?:\s*[;,]\s*(?:[a-zA-Z0-9]+:[^\];,\s]+|\d+))+)\]"
+)
+
 def order_citations_by_appearance(text: str, candidates: List[Tuple[str, Any]]) -> Tuple[str, List[Any]]:
     """
     Renumbers a text's [marker] citations so [1] is whichever candidate is
@@ -347,6 +356,21 @@ def order_citations_by_appearance(text: str, candidates: List[Tuple[str, Any]]) 
         [i+1] refers to in rewritten_text - callers can pass this directly
         wherever a synthesis's valid_records/citations are expected.
     """
+    # Split a grouped citation like "[doi:A; doi:B]" or "[1, 2]" into
+    # separate "[doi:A][doi:B]" brackets FIRST - the matching below looks
+    # for an EXACT "[marker]" substring per candidate, so a grouped
+    # bracket doesn't equal any single candidate's marker and was left
+    # completely un-rewritten even when every marker inside it was
+    # individually valid and already cited elsewhere in the text
+    # (confirmed live: an investigation-agent report that grouped two
+    # already-cited fingerprints together this way left exactly that one
+    # bracket as raw, unclickable text in an otherwise fully-renumbered
+    # synthesis).
+    text = _MULTI_MARKER_RE.sub(
+        lambda m: "".join(f"[{t}]" for t in re.split(r"\s*[;,]\s*", m.group(1))),
+        text or "",
+    )
+
     first_seen = []
     for marker, record in candidates:
         idx = text.find(f"[{marker}]")
@@ -376,4 +400,29 @@ def order_citations_by_appearance(text: str, candidates: List[Tuple[str, Any]]) 
     rewritten = pattern.sub(lambda m: f"[{marker_to_new[m.group(1)]}]", text)
 
     return rewritten, ordered_records
+
+
+_FINGERPRINT_MARKER_RE = re.compile(r"\[([a-zA-Z0-9]+:[^\]\s]+)\]")
+
+def extract_bracket_fingerprints(text: str) -> List[str]:
+    """
+    Finds every distinct "[prefix:value]" bracket marker in `text` that's
+    SHAPED like a Record fingerprint (make_fingerprint always produces
+    "doi:...", "pmid:...", "pmcid:...", "arxiv:...", or a
+    "{source}:{source_id}" fallback - always colon-delimited) - used by
+    pipeline.agent's investigation agent (see its system prompt: "cite
+    papers using their fingerprint in brackets, e.g. [doi:10.1234/xyz]") to
+    find every paper it MIGHT have cited, as candidates for
+    order_citations_by_appearance beyond whatever a narrower DB query
+    already found (see run_investigation's docstring in
+    ui/callbacks/chat.py for why that narrower query alone isn't enough).
+
+    Callers are expected to look each result up and silently discard
+    anything that isn't a real, known fingerprint - this only recognizes
+    the SHAPE of a marker, not whether one genuinely exists, so a markdown
+    link written as "[Some Report](url)" or a stray "[Note: see above]"
+    can produce a false-positive candidate that a DB lookup then filters
+    out harmlessly.
+    """
+    return sorted(set(_FINGERPRINT_MARKER_RE.findall(text or "")))
 

@@ -28,6 +28,7 @@ from langgraph.prebuilt import create_react_agent
 
 from database.repository import AtelierRepository
 from llm.engine import AtelierAIEngine
+from llm.model_catalog import chat_history_turn_count, session_paper_list_count
 
 from .agent_tools import build_investigation_tools
 from .orchestrator import CHECKPOINT_DB_PATH
@@ -59,6 +60,7 @@ Rules:
 4. IMPORTANT for speed: analyze_papers accepts MULTIPLE fingerprints in one call and analyzes them concurrently - if you need to look at several papers for the same angle (e.g. comparing how 4 papers each treat a topic), pass ALL of their fingerprints in ONE analyze_papers call, never one call per paper. Same for get_full_text/rag_search_chunks when you already know you need several specific papers - request what you can up front rather than one at a time when the results don't depend on each other.
 5. Cite papers using their fingerprint in brackets, e.g. [doi:10.1234/xyz], so the user can trace every claim back to a real source.
 6. Give your final answer as clear, direct prose - not a tool-call log. Once you have enough to answer, stop calling tools and answer.
+7. Do NOT write your own "References" or "Bibliography" section, even for a long report. Atelier automatically builds a complete, correctly-formatted reference list from every [fingerprint] you cite in the prose - a second, self-written one is redundant at best and produces a confusing duplicate at worst. End your answer once the prose itself is done.
 """
 
 
@@ -103,7 +105,11 @@ def run_investigation(
         agent = create_react_agent(llm, tools, checkpointer=checkpointer, prompt=_SYSTEM_PROMPT)
 
         messages = []
-        for turn in (chat_history or [])[-6:]:
+        # Scaled to the SELECTED model's real context window
+        # (llm.model_catalog.chat_history_turn_count), not a fixed count -
+        # see llm.engine.chat_with_literature's identical change for the
+        # full reasoning.
+        for turn in (chat_history or [])[-chat_history_turn_count(model_choice):]:
             if turn.get("role") == "user":
                 messages.append(HumanMessage(content=turn.get("content", "")))
             else:
@@ -168,7 +174,10 @@ def run_investigation(
 
 def _fallback_chat(engine: AtelierAIEngine, session_id: str, query: str, chat_history: Optional[List[Dict[str, str]]]) -> Dict[str, Any]:
     """Graceful degradation path - see run_investigation's docstring."""
-    context_records = AtelierRepository.get_session_processed_papers(session_id, limit=20)
+    # session_paper_list_count, not a fixed limit - scales with the
+    # selected model's context window, same reasoning as
+    # pipeline/agent_tools.py's list_session_papers tool using it.
+    context_records = AtelierRepository.get_session_processed_papers(session_id, limit=session_paper_list_count(engine.model_choice))
     fallback_history = (chat_history or []) + [{"role": "user", "content": query}]
     answer = engine.chat_with_literature(
         chat_history=fallback_history,

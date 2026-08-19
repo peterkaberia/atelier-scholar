@@ -22,7 +22,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from core.config import resolve_key, STUDY_TYPE_WEIGHTS
 from core.exceptions import AIOutputError, AIProviderError, AtelierAIError
 from core.utils import classify_study_type, citation_bonus, is_yes_no_question
-from llm.utils import _common_llm_params, _is_set, resolve_model_config, get_model_choices
+from llm.model_catalog import chat_history_turn_count
+from llm.utils import LLM_REQUEST_TIMEOUT_SECONDS, LLM_TIMEOUT_PARAM_BY_CLASS, _common_llm_params, _is_set, resolve_model_config, get_model_choices
 
 warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
@@ -51,7 +52,9 @@ def _get_val(obj: Any, key: str, default: Any = "") -> Any:
 
 def _format_synthesis_entry(i: int, r: Any) -> str:
     """
-    Builds one paper's entry in generate_copilot_synthesis's context.
+    Builds one paper's entry in chat_with_literature's context - the
+    single synthesis/chat prompt used for EVERY turn, first query and
+    follow-up alike (see that function's docstring).
     Previously this was just "[N] Title - one-line answer"; now it also
     surfaces the structured extraction fields already sitting on every
     record (population/methods/results/outcomes - extracted once during
@@ -213,6 +216,15 @@ class AtelierAIEngine:
 
         # Merge unified parameters with the specific requested temperature
         all_params = {**_common_llm_params, **model_specific_params, "temperature": temperature}
+
+        # See LLM_REQUEST_TIMEOUT_SECONDS' docstring in llm/utils.py for
+        # why this exists at all. Looked up by class, not folded into
+        # _common_llm_params above, since each provider names this
+        # constructor param differently - no-op (silently skipped) for a
+        # provider with no entry there (currently just Ollama).
+        timeout_param = LLM_TIMEOUT_PARAM_BY_CLASS.get(llm_class)
+        if timeout_param and timeout_param not in all_params:
+            all_params[timeout_param] = LLM_REQUEST_TIMEOUT_SECONDS
 
         return llm_class(**all_params)
 
@@ -484,74 +496,6 @@ class AtelierAIEngine:
             for p in papers
         ]
 
-    def generate_copilot_synthesis(self, topic: str, valid_records: List[Any]) -> str:
-        """
-        Writes an objective literature review summarizing findings from multiple relevant papers.
-        
-        Args:
-            topic (str): The user's original query.
-            valid_records (List[Any]): A list of extracted paper records/dictionaries.
-            
-        Returns:
-            str: Plain markdown synthesis with bare [1]/[2] bracket
-                citations - NOT HTML-enriched. Interactive citation
-                tooltips are rendered exactly once, at display time, by
-                ui/layouts/feed.py's build_synthesis_body - baking HTML in
-                here too used to double-process the same text every time
-                it was displayed (this string gets persisted to the DB
-                as-is and re-rendered on every future page load).
-        """
-        sys_prompt = f"""
-        You are the Atelier Synthesizer, an expert at writing academic literature review abstracts.
-        Your task is to read the provided paper extracts - each includes a one-line takeaway, structured study details (population/methods/results/outcomes), evidence-tier metadata (study type, citation count) and, where available, an actual excerpt from the paper's full text - and write the answer in the voice and shape of a published journal abstract: dense, structured, evidence-forward prose, not a loose bulleted breakdown.
-
-        Structure the output with these four Markdown headers, in this order, every time:
-
-        ### Background
-        1 sentence of plain framing: what question the literature is being asked to answer.
-
-        ### Evidence Synthesis
-        The core of the abstract - a dense paragraph (not bullets) synthesizing what the body of evidence actually shows, written the way a journal abstract's Results section reads. This is where evidence strength/consistency gets characterized, not listed separately: name real counts and the strongest study types driving any agreement (e.g. "12 of 17 studies support this, particularly the systematic reviews and RCTs [2][5][9]"), and call out disagreement plainly, noting if it splits along evidence quality (e.g. "the higher-powered cohort studies find X, while the effect is weaker in smaller case series"). Never fabricate a count that isn't clearly supported by the provided papers - "most papers.../a minority of studies..." is fine when an exact number would be a guess.
-
-        ### Key Findings
-        The detailed breakdown, formatted however best fits what the papers actually discuss:
-        - Distinct variables/causes → a Markdown table.
-        - A debated issue → a "Pros & Cons" list.
-        - A definitional/conceptual question → thematic bullet points.
-
-        ### Conclusion
-        1 sentence naming the main gap in the literature, if one is apparent from the provided papers.
-
-        Rules:
-        1. Base your answer ENTIRELY on the provided insights. Do not introduce outside knowledge.
-        2. Prefer grounding specific claims (numbers, effect sizes, specific findings) in a paper's "Results"/"Excerpt" text over its one-line takeaway when both are available - the takeaway is a summary, the results/excerpt are the actual evidence.
-        3. You MUST cite the source of every claim using bracketed numbers corresponding to the paper index (e.g., [1]).
-        CRITICAL: If citing multiple papers, use separate brackets like [1][2]. DO NOT use comma-separated formats like [1, 2].
-        4. COVERAGE REQUIREMENT: {len(valid_records)} papers are provided below, numbered [1] through [{len(valid_records)}]. Every single one MUST be cited somewhere across the whole answer - do not silently drop any of them, even minor or tangential ones. If a paper only weakly supports the topic, still work it in (a Key Findings table row, a brief caveat in Evidence Synthesis, or the Conclusion) rather than omitting its citation entirely. Before finishing, verify every number from [1] to [{len(valid_records)}] appears at least once.
-        """
-
-        context = "".join(_format_synthesis_entry(i, r) for i, r in enumerate(valid_records))
-
-        try:
-            # Returned as plain markdown with bare [1]/[2] bracket citations
-            # - NOT HTML-enriched here. Citation-to-tooltip HTML rendering
-            # happens exactly once, at render time, in
-            # ui/layouts/feed.py's build_synthesis_body. Enriching here too
-            # used to double-process the same text (this raw_md gets saved
-            # to the DB as-is, then build_synthesis_body ran ITS OWN
-            # citation regex over the ALREADY-HTML-enriched result on every
-            # render) - a block-level <div> landing inline inside markdown
-            # text via dangerously_allow_html confused Dash's markdown
-            # parser, producing literal always-visible tooltip text instead
-            # of a hidden-until-hover tooltip.
-            return self._execute(
-                temperature=0.1,
-                system_msg=sys_prompt,
-                user_inputs={"input_data": f"Topic: {topic}\nContext:\n{context}"},
-                is_json=False
-            )
-        except AtelierAIError:
-            return "Failed to generate synthesis due to an AI processing error. Please try again."
 
     def generate_atelier_meter(self, topic: str, valid_records: List[Any]) -> Optional[dict]:
         """
@@ -792,17 +736,28 @@ class AtelierAIEngine:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5), reraise=True)
     def chat_with_literature(self, chat_history: List[Dict[str, str]], context_records: List[Any]) -> str:
         """
-        Context-aware Conversational RAG. Answers deep-dive questions based on the 
-        currently loaded paper feed. Bypasses standard templates to safely ingest user strings.
-        
+        Context-aware Conversational RAG - the single synthesis/chat entry
+        point for EVERY turn, not just follow-ups: ui/callbacks/search.py's
+        generate_synth calls this for a session's very first query too
+        (chat_history=[{"role": "user", "content": query}], no prior
+        turns), so a first-time question and a tenth follow-up go through
+        identical genre-detection logic (QUESTION/REWRITE/WRITTEN-
+        DELIVERABLE - see the system prompt below) rather than the first
+        one being forced into a fixed structured-abstract template
+        regardless of how it was actually phrased.
+
         Args:
             chat_history (List[Dict]): Historical role/content pairings.
             context_records (List[Any]): Papers currently loaded in the feed view.
-            
+
         Returns:
             str: Plain markdown AI response with bare [1]/[2] citations -
-                see generate_copilot_synthesis's docstring for why HTML
-                citation enrichment isn't done here.
+                NOT HTML-enriched here. Interactive citation tooltips are
+                rendered exactly once, at display time, by
+                ui/layouts/feed.py's build_synthesis_body - doing it here
+                too would double-process the same text every time it's
+                displayed (this string gets persisted to the DB as-is and
+                re-rendered on every future page load).
         """
         llm = self._get_llm(temperature=0.3)
         context_str = "".join(_format_synthesis_entry(i, r) for i, r in enumerate(context_records))
@@ -822,7 +777,7 @@ class AtelierAIEngine:
         - If their text makes a claim the Context doesn't address, don't silently drop it or invent evidence for it - note briefly (e.g. a short bracketed aside) that the literature here doesn't cover that specific point.
 
         3. WRITTEN-DELIVERABLE REQUESTS (the user is asking you to WRITE something in a specific genre/format from scratch using the Context - e.g. "write a 300-word abstract", "write a summary paragraph", "write an introduction"):
-        - Match the ACTUAL CONVENTIONS of the requested genre, not the structure of an earlier message in this conversation. An abstract in particular is DENSE FLOWING PROSE - one or a few unbroken paragraphs, written in past/present tense as a self-contained synopsis. It is NEVER broken into headers like "Background/Evidence Synthesis/Key Findings/Conclusion", and NEVER contains a Markdown table or bullet list - those belong to Atelier's separate full literature-review synthesis, a different deliverable from what's being asked for here. If the earlier conversation contains that format, do not imitate it just because it's nearby.
+        - Match the ACTUAL CONVENTIONS of the requested genre, not the structure of an earlier message in this conversation. An abstract in particular is DENSE FLOWING PROSE - one or a few unbroken paragraphs, written in past/present tense as a self-contained synopsis. It is NEVER broken into headers like "Background/Evidence Synthesis/Key Findings/Conclusion", and NEVER contains a Markdown table or bullet list - those belong to a structured literature-review write-up, not a plain abstract. If the earlier conversation contains that format, do not imitate it just because it's nearby.
         - Respect any requested length (e.g. "300 words") as a real target, not a suggestion to ignore.
         - COVERAGE: draw on and cite as much of the full Context as genuinely fits the requested length and topic, not just the first few papers - {len(context_records)} papers are available below; a comprehensive deliverable like an abstract should engage with the breadth of the evidence, not a narrow subset of it.
 
@@ -834,19 +789,23 @@ class AtelierAIEngine:
         """
 
         messages = [SystemMessage(content=sys_prompt)]
-        
-        # Keep only the last 6 messages to preserve token window
-        for msg in chat_history[-6:]:
+
+        # Keep only the most recent messages to preserve token window -
+        # scaled to the SELECTED model's real context window
+        # (llm.model_catalog.chat_history_turn_count), not a fixed count
+        # that wasted a big-context model's ability to actually remember
+        # the conversation.
+        for msg in chat_history[-chat_history_turn_count(self.model_choice):]:
             if msg["role"] == "user":
                 messages.append(HumanMessage(content=msg["content"]))
             else:
                 messages.append(AIMessage(content=msg["content"]))
             
         try:
-            # Plain markdown with bare [1]/[2] citations - see
-            # generate_copilot_synthesis's docstring for why HTML citation
-            # enrichment belongs solely in build_synthesis_body at render
-            # time, not baked in here.
+            # Plain markdown with bare [1]/[2] citations - see this
+            # function's own docstring for why HTML citation enrichment
+            # belongs solely in build_synthesis_body at render time, not
+            # baked in here.
             return llm.invoke(messages).content
         except Exception as e:
             logger.error(f"Chat failed: {e}")

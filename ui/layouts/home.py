@@ -19,15 +19,35 @@ def layout_home():
         # of docked to the bottom, since this is the landing page.
         html.Div(className="relative z-10 w-full max-w-3xl mx-auto animate-fade-in px-4 md:px-0", style={"animationDelay": "0.2s"}, children=[
             html.Div(className="glass-chat-bar rounded-3xl p-4 md:p-6 flex flex-col transition-all duration-300", children=[
+                # Same id as ui/layouts/feed.py's identical chip row -
+                # home/feed are mutually exclusive routes, so reusing it
+                # lets ui/callbacks/uploads.py's stage_uploads/
+                # remove_pending_upload callbacks work unmodified on
+                # whichever page is actually mounted.
+                html.Div(id="pending-uploads-container", className="flex items-center mb-4 px-1 gap-2 md:gap-3 overflow-x-auto no-scrollbar empty:hidden"),
                 html.Div(className="flex items-center w-full px-1 mb-3", children=[
                     dcc.Textarea(
                         id="hero-search-input",
-                        className="w-full bg-transparent border-none text-slate-800 placeholder-slate-400 focus:ring-0 text-[16px] md:text-[18px] font-medium py-1 outline-none resize-none min-h-[28px] max-h-[160px] leading-relaxed",
+                        className="w-full bg-transparent border-none text-slate-800 placeholder-slate-400 focus:ring-0 text-[16px] md:text-[18px] font-medium py-1 outline-none resize-none min-h-[28px] max-h-[45vh] leading-relaxed overflow-y-auto",
                         placeholder="Ask a question or synthesize research...", rows=1
                     )
                 ]),
                 html.Div(className="flex items-center justify-between px-1 gap-2", children=[
-                    html.Button(html.Span("attach_file", className="material-symbols-outlined text-2xl"), className="p-2 text-slate-400 hover:text-primary transition-colors hover:bg-slate-100/50 rounded-lg flex-shrink-0"),
+                    # dcc.Upload, not a plain button - see
+                    # ui/layouts/feed.py's identical control for why (a
+                    # plain html.Button can't open a file picker or
+                    # receive file data). Same id as feed's - see this
+                    # Div's own comment above.
+                    dcc.Upload(
+                        id='file-upload',
+                        multiple=True,
+                        accept=".pdf,.txt,.md,.markdown",
+                        className="inline-flex",
+                        children=html.Div(
+                            html.Span("attach_file", className="material-symbols-outlined text-2xl"),
+                            className="p-2 text-slate-400 hover:text-primary transition-colors hover:bg-slate-100/50 rounded-lg cursor-pointer flex-shrink-0",
+                        ),
+                    ),
                     html.Div(className="flex items-center gap-2 md:gap-3", children=[
                         html.Div(className="relative group", children=[
                             dcc.Dropdown(

@@ -23,6 +23,7 @@ from core.config import DEFAULT_SPARSE_MODEL
 from core.utils import chunk_text, extract_keywords, truncate
 from database import AtelierRepository
 from llm.engine import AtelierAIEngine
+from llm.model_catalog import batch_extraction_content_budget, synthesis_passage_budget
 from search import AtelierAcademicSearch
 from search.sparse_encoder import compute_scores, encode_chunks, encode_query_sparse
 
@@ -30,29 +31,15 @@ from .state import ResearchState
 
 logger = logging.getLogger(__name__)
 
-# Character budget for extraction payloads - matches the abstract-only budget
-# the pipeline already used, so full-text RAG doesn't blow past token limits.
-EXTRACTION_CONTENT_BUDGET = 12000
-
-# How many of a paper's most relevant passages to feed into extraction.
-CHUNKS_PER_PAPER = 5
-
 # How many papers go into a single batched extraction LLM call (see
-# extract_node). A smaller, separate content budget applies per paper INSIDE
-# a batch - batch_size * BATCH_EXTRACTION_CONTENT_BUDGET has to stay within
-# a reasonable prompt size for whatever model the user has configured
-# (including smaller local models with limited context windows), whereas
-# EXTRACTION_CONTENT_BUDGET above assumes one paper has the whole budget to
-# itself.
+# extract_node). Each paper's own share of that call's content budget comes
+# from llm.model_catalog.batch_extraction_content_budget(model_choice,
+# EXTRACTION_BATCH_SIZE) - scaled to the SELECTED model's real context
+# window, not a fixed constant identical for every model regardless of its
+# actual capacity (see that module's "CONTEXT-BUDGET SCALING" section for
+# why: a hardcoded budget wasted a huge-context model's real capacity, and
+# a big enough one could overflow a genuinely small-context model's window).
 EXTRACTION_BATCH_SIZE = 4
-BATCH_EXTRACTION_CONTENT_BUDGET = 4000
-
-# Character budget for the single short passage carried through to
-# generate_copilot_synthesis (llm/engine.py) per paper - deliberately much
-# smaller than the extraction budgets above: this one gets duplicated once
-# per cited paper INTO the final synthesis prompt (up to ~20 papers), so it
-# has to stay small per-paper to keep that prompt's total size reasonable.
-SYNTHESIS_PASSAGE_BUDGET = 400
 
 # How many genuinely viable (real abstract, or a fetchable full-text
 # source) candidates extraction tries to gather, and how large a
@@ -256,7 +243,7 @@ def _ensure_full_text_chunks(rec: Any, searcher: AtelierAcademicSearch) -> None:
 def _build_extraction_content(
     rec: Any,
     topic_vector: Optional[Dict[str, float]],
-    budget: int = EXTRACTION_CONTENT_BUDGET,
+    budget: int,
 ) -> str:
     """
     Prefers the paper's most relevant full-text passages (real RAG) over its
@@ -264,15 +251,24 @@ def _build_extraction_content(
     scoring fails for any reason.
 
     Args:
-        budget: Character cap for the returned content - smaller when this
-            paper is one of several sharing a single batched extraction
-            call (see extract_node/BATCH_EXTRACTION_CONTENT_BUDGET), since
-            the prompt has to fit ALL of them, not just one.
+        budget: Character cap for the returned content - the caller's
+            share of that call's total content budget (see
+            llm.model_catalog.batch_extraction_content_budget), smaller
+            when this paper is one of several sharing a single batched
+            extraction call since the prompt has to fit ALL of them, not
+            just one.
     """
     if topic_vector:
         try:
+            # Retrieve enough chunks to plausibly FILL `budget` (~1200
+            # chars/chunk - core.utils.chunk_text's default chunk_size),
+            # not a fixed count - a bigger budget (a larger-context model,
+            # see llm.model_catalog) should pull proportionally more
+            # material, not leave the rest of its own budget unused.
+            # truncate() below still enforces the exact cap either way.
+            top_k = max(3, min(30, (budget // 1200) + 1))
             top_chunks = AtelierRepository.get_top_chunks_for_paper(
-                rec.fingerprint, topic_vector, top_k=CHUNKS_PER_PAPER
+                rec.fingerprint, topic_vector, top_k=top_k
             )
             if top_chunks:
                 return truncate("\n\n".join(top_chunks), budget)
@@ -406,28 +402,47 @@ def extract_records(
         logger.warning(f"Topic query encoding failed; full-text RAG disabled for this run: {e}")
         topic_vector = None
 
+    # Computed ONCE per call, not per paper - both scale with the SELECTED
+    # model's real context window (llm.model_catalog's "CONTEXT-BUDGET
+    # SCALING" section), not a fixed constant. batch_budget assumes every
+    # paper in a batch shares one prompt; passage_budget assumes up to
+    # `limit` papers' excerpts all share the later final synthesis prompt
+    # together (see _attach_top_passage below).
+    batch_budget = batch_extraction_content_budget(model_choice, EXTRACTION_BATCH_SIZE)
+    passage_budget = synthesis_passage_budget(model_choice, limit)
+
     def _attach_top_passage(rec: Any) -> None:
         """
         Sets rec.top_passage to a short, topic-relevant full-text excerpt
         (see Record.top_passage's docstring) - a no-op if this paper has no
         stored full-text chunks. Applied uniformly to every processed
         record, reused-from-cache or freshly-extracted, so
-        generate_copilot_synthesis (llm/engine.py) gets real passage-level
-        RAG grounding for the final synthesis, not just each paper's
-        1-sentence "answer" summary.
+        llm.engine.chat_with_literature (the final synthesis/chat call,
+        first query and follow-up alike) gets real passage-level RAG
+        grounding, not just each paper's 1-sentence "answer" summary.
         """
         if not topic_vector:
             return
         try:
-            top = AtelierRepository.get_top_chunks_for_paper(rec.fingerprint, topic_vector, top_k=1)
+            # Retrieve enough chunks to plausibly FILL passage_budget
+            # (~1200 chars/chunk), not always just the single best one -
+            # top_k=1 used to silently under-fill this budget once it
+            # started scaling with the selected model (llm.model_catalog's
+            # "CONTEXT-BUDGET SCALING"): a passage_budget of e.g. 4000
+            # chars still only ever got ~1200 chars of ACTUAL content, the
+            # rest of the allowance simply never used. Same
+            # retrieve-to-fit-the-budget reasoning as
+            # _build_extraction_content above.
+            top_k = max(1, min(10, (passage_budget // 1200) + 1))
+            top = AtelierRepository.get_top_chunks_for_paper(rec.fingerprint, topic_vector, top_k=top_k)
             if top:
-                rec.top_passage = truncate(top[0], SYNTHESIS_PASSAGE_BUDGET)
+                rec.top_passage = truncate("\n\n".join(top), passage_budget)
         except Exception as e:
             logger.warning(f"Top-passage retrieval failed for {rec.fingerprint}: {e}")
 
     def _finalize(rec: Any, ai_data: dict) -> None:
         """Shared success path for both the reused-cache and freshly-extracted branches."""
-        AtelierRepository.update_record_ai_data(session_id, rec.pmid, ai_data)
+        AtelierRepository.update_record_ai_data(session_id, rec.fingerprint, ai_data)
         rec.answer = str(ai_data.get("answer", "-"))
         _attach_top_passage(rec)
         rec_dict = rec.__dict__
@@ -468,7 +483,7 @@ def extract_records(
             {
                 "paper_index": i,
                 "title": rec.title,
-                "content": _build_extraction_content(rec, topic_vector, budget=BATCH_EXTRACTION_CONTENT_BUDGET),
+                "content": _build_extraction_content(rec, topic_vector, budget=batch_budget),
             }
             for i, rec in enumerate(batch)
         ]

@@ -25,19 +25,13 @@ from core.config import DEFAULT_SPARSE_MODEL
 from database.models import Record
 from database.repository import AtelierRepository
 from llm.engine import AtelierAIEngine
+from llm.model_catalog import full_text_tool_budget, rag_chunk_count, session_paper_list_count
 from pipeline.nodes import _fetch_and_encode_full_text, _persist_full_text_result
 from pipeline.orchestrator import ResearchOrchestrator
 from search.fetchers import AtelierAcademicSearch
 from search.sparse_encoder import encode_query_sparse
 
 logger = logging.getLogger(__name__)
-
-# Caps how much of a paper's text a single tool observation feeds back into
-# the agent's own context - a full paper can be tens of thousands of
-# characters, which would blow past a smaller model's context window on its
-# own, let alone alongside the rest of the conversation and other tool
-# results already in play.
-MAX_FULL_TEXT_CHARS = 6000
 
 
 def _resolve_full_text(fingerprint: str, record_dict: dict, searcher: AtelierAcademicSearch) -> str:
@@ -88,7 +82,9 @@ def build_investigation_tools(session_id: str, model_choice: str, touched_finger
     @tool
     def list_session_papers() -> str:
         """List the papers already available in this research session, with their titles and one-line takeaways. ALWAYS call this first before searching for new papers or analyzing a specific one - the answer may already be at hand."""
-        records = AtelierRepository.get_session_processed_papers(session_id, limit=30)
+        # session_paper_list_count, not a fixed limit - scales with the
+        # selected model's context window, see its docstring.
+        records = AtelierRepository.get_session_processed_papers(session_id, limit=session_paper_list_count(model_choice))
         if not records:
             return "No papers have been processed in this session yet."
         return "\n".join(f"[{r.fingerprint}] {r.title} - {r.answer}" for r in records)
@@ -125,7 +121,14 @@ def build_investigation_tools(session_id: str, model_choice: str, touched_finger
         text = _resolve_full_text(fingerprint, record_dict, searcher)
         if not text:
             return f"No full text is available for '{record_dict.get('title')}', and it has no abstract either."
-        return text[:MAX_FULL_TEXT_CHARS]
+        # Scaled to the SELECTED model's real context window
+        # (llm.model_catalog.full_text_tool_budget), not a fixed constant -
+        # a full paper can be tens of thousands of characters, which would
+        # blow past a smaller model's window on its own, let alone
+        # alongside the rest of the conversation and other tool results
+        # already in play; a larger-context model gets proportionally more
+        # of the paper instead of the same fixed slice every model got.
+        return text[:full_text_tool_budget(model_choice)]
 
     @tool
     def rag_search_chunks(fingerprint: str, query: str) -> str:
@@ -146,7 +149,10 @@ def build_investigation_tools(session_id: str, model_choice: str, touched_finger
         except Exception as e:
             return f"Couldn't encode the query for retrieval: {e}"
 
-        passages = AtelierRepository.get_top_chunks_for_paper(fingerprint, query_vector, top_k=3)
+        # rag_chunk_count, not a fixed top_k - scales (modestly - this is a
+        # TARGETED retrieval, not a full-text read) with the selected
+        # model's context window, see its docstring.
+        passages = AtelierRepository.get_top_chunks_for_paper(fingerprint, query_vector, top_k=rag_chunk_count(model_choice))
         if not passages:
             return f"No full text available to search for '{record_dict.get('title')}' - try analyze_papers on its abstract instead."
         return "\n---\n".join(passages)

@@ -60,6 +60,38 @@ _common_callbacks = [BufferedStreamingHandler()]
 # Define common parameters for most LLMs
 _common_llm_params = {"temperature": 0.0, "streaming": True, "callbacks": _common_callbacks}
 
+# Ceiling for a single LLM call, applied per-provider below - generous
+# enough for a genuinely long generation (a multi-thousand-word synthesis
+# across many papers can legitimately take a while) but short enough that
+# a stalled/hung provider response fails within a predictable window
+# instead of leaving a background job stuck indefinitely with zero
+# user-facing feedback. Confirmed live: a query-PLANNING call (normally a
+# few seconds - it's just producing a handful of boolean search strings,
+# not a report) hung for 13+ minutes with no error at all and no way for
+# the user to tell "stuck" from "just slow," on a session whose topic was
+# an unusually long pasted paragraph rather than a short question - once
+# this fires, llm.engine._execute's existing @retry+reraise and
+# run_search/generate_synth's existing try/except already turn that into
+# a normal, visible STATUS_FAILED + Retry button instead.
+LLM_REQUEST_TIMEOUT_SECONDS = 300
+
+# Each LangChain chat model class names its request-timeout constructor
+# parameter differently - there's no single kwarg that works across all of
+# them (confirmed by inspecting each class's actual fields: Anthropic uses
+# default_request_timeout, Google/OpenAI use timeout/request_timeout, Groq
+# uses request_timeout) - so this can't just be folded into the shared
+# _common_llm_params dict above the way temperature/streaming/callbacks
+# are; llm.engine's _get_llm looks up the right name per class instead.
+# ChatOllama is deliberately absent - it exposes no timeout constructor
+# param at all, and as a local server it isn't subject to the same
+# provider-network-hang risk this is guarding against.
+LLM_TIMEOUT_PARAM_BY_CLASS = {
+    ChatAnthropic: "default_request_timeout",
+    ChatGoogleGenerativeAI: "timeout",
+    ChatGroq: "request_timeout",
+    ChatOpenAI: "request_timeout",  # also covers OpenRouter/LM Studio - both resolve to ChatOpenAI, see resolve_model_config
+}
+
 # Cloud providers: (provider prefix, LangChain class, Settings/.env key name).
 # No per-model entries here anymore - see resolve_model_config()/get_model_choices()
 # below, which list each provider's actual current models live instead of a

@@ -14,9 +14,10 @@
 * 🧠 **LLM-Orchestrated Pipeline:** A [LangGraph](https://github.com/langchain-ai/langgraph) state machine plans queries, searches, ranks, extracts, and synthesizes - checkpointed via SQLite so an interrupted run resumes exactly where it left off instead of restarting from scratch.
 * 🔍 **Six-Engine Retrieval:** Searches **PubMed**, **Europe PMC**, **OpenAlex**, **Semantic Scholar**, **Crossref**, and **arXiv** in parallel, merges and deduplicates by a global fingerprint (DOI/PMID/PMCID/arXiv ID), and surfaces per-engine failures instead of silently under-reporting.
 * 📊 **Quality-Weighted Ranking:** Relevance scoring blends SPLADE sparse-vector similarity with citation count, recency, and a study-type evidence tier (systematic review > RCT > cohort > case report, etc.) - not just topical match.
+* 📐 **Context-Aware RAG Budgets:** How much full-text content gets pulled into extraction, synthesis, and the investigation agent's tool calls scales with the *selected model's own context window* (fetched live from OpenRouter/Google, where available) - a huge-context model like Gemini genuinely gets more material to work with per paper, not the same fixed slice a small model gets.
 * 🧭 **Atelier Meter:** For yes/no-shaped research questions, a weighted agreement bar shows how the literature actually leans, with each paper's vote weighted by its evidence tier and citation count rather than counted equally.
-* ✍️ **Abstract-Style Synthesis:** Background → Evidence Synthesis → Key Findings → Conclusion, written in real academic-abstract prose that explicitly characterizes how strong and consistent the evidence is - not just a list of findings.
-* 💬 **Context-Aware Follow-Ups:** A router classifies each follow-up as a new SEARCH, a context-only CHAT, or an active INVESTIGATE - ask questions, request a rewrite of your own pasted draft with citations woven in, or ask for a specific deliverable ("write a 300-word abstract", "write an introduction") - each handled with its own genre-appropriate prompt. Follow-ups first check papers your original search already found but didn't extract before falling back to a full new external search.
+* ✍️ **Genre-Adaptive Synthesis:** Your very first question and every follow-up go through the same prompt: ask a plain question and get a direct, closed-book answer; ask for a rewrite of your own pasted draft and get it strengthened with citations woven in; ask for a specific deliverable ("write a 300-word abstract", "write a structured report") and get that genre's real conventions, not a fixed template - no result is forced into a one-size-fits-all format regardless of what you actually asked for.
+* 💬 **Context-Aware Follow-Ups:** A router classifies each follow-up as a new SEARCH, a context-only CHAT, or an active INVESTIGATE. Follow-ups first check papers your original search already found but didn't extract before falling back to a full new external search.
 * 🕵️ **Deep-Dive Investigation Agent:** A LangGraph ReAct tool-calling agent for follow-ups that need active digging rather than just answering from what's already on screen - it can search for more papers, fetch a specific paper's full text, run a RAG search over already-fetched full-text chunks, and analyze multiple papers in parallel, citing exactly what it actually used. Falls back to plain context-aware chat if the agent itself fails.
 * 📄 **Per-Paper AI Summaries:** Click any paper for a topic-focused summary, its full author list, a link to the journal (via DOI), and an in-app PDF viewer - summaries are cached per session so re-opening a paper is instant.
 * 📥 **Reference Export:** Download citations as BibTeX or RIS, either the whole turn's reference list (selection-aware) or a single paper at a time - compatible with Zotero, EndNote, and Mendeley.
@@ -100,6 +101,78 @@ uv run python app.py
 3. Atelier plans the search, fetches papers from all six engines, ranks and extracts the most relevant ones, and generates a fully cited, abstract-style synthesis - plus an Atelier Meter if the question is yes/no-shaped.
 4. Ask follow-ups in the same thread: pointed questions, "rewrite this paragraph with the evidence," "write me a 300-word abstract," or something that needs active digging ("find more papers on X and compare them") - Atelier routes each one to the right mode automatically.
 5. Download any turn as a PDF, or export its references as BibTeX/RIS, from that turn's header.
+
+## 🧭 How the AI Pipeline Decides
+
+Every question - your first one or a tenth follow-up, typed or attached as a document - goes through the same decision tree. Nothing is hardcoded to "first message always gets a search" or "an upload always answers alone": what actually happens depends on what you gave it and what the session already knows.
+
+```mermaid
+flowchart TD
+    Start(["User submits a question"]) --> Origin{"Home page or an<br/>existing session?"}
+
+    Origin -->|"Home page (new session)"| HomeFiles{"Files attached?"}
+    Origin -->|"Existing session (follow-up)"| FeedFiles{"Files attached?"}
+
+    HomeFiles -->|No| Search
+    HomeFiles -->|"Files only, no question"| Upload["Ingest file(s), fold into<br/>the session's evidence pool"]
+    HomeFiles -->|"Files + a question"| Search
+
+    FeedFiles -->|Yes| Upload
+    FeedFiles -->|No| Route
+
+    Route{"route_intent: does this<br/>session already have<br/>papers &amp; a topic?"}
+    Route -->|"No prior context yet"| Search
+    Route -->|Yes| Classify{"LLM classifies<br/>the request"}
+
+    Classify -->|"needs new evidence"| CheckLocal{"Already-fetched papers<br/>cover it?"}
+    Classify -->|"question / rewrite / deliverable"| Chat
+    Classify -->|"needs active digging"| Agent
+
+    CheckLocal -->|"Yes - reclassify"| Classify
+    CheckLocal -->|No| Search
+
+    subgraph SearchPipeline["Search &amp; Extraction Pipeline"]
+        Search["Plan per-engine boolean<br/>queries (LLM)"] --> Fetch["Fetch PubMed, Europe PMC,<br/>OpenAlex, Semantic Scholar,<br/>Crossref, arXiv in parallel"]
+        Fetch --> FoundAny{"Any candidates found?"}
+        FoundAny -->|"No (retries left)"| Broaden["Broaden the query"]
+        Broaden --> Fetch
+        FoundAny -->|"No (out of retries)"| Empty(["No results"])
+        FoundAny -->|Yes| Score["SPLADE-score, rank &amp; save"]
+        Score --> Extract["LLM extracts structured<br/>findings per paper"]
+        Extract --> EnoughRelevant{"Enough relevant<br/>papers found?"}
+        EnoughRelevant -->|"No (retries left)"| Broaden
+    end
+
+    EnoughRelevant -->|"Yes, or out of retries"| MergeUpload{"Files also attached<br/>to this turn?"}
+    MergeUpload -->|Yes| Merge["Ingest &amp; fold into<br/>the same evidence pool"]
+    MergeUpload -->|No| Synthesize
+    Merge --> Synthesize
+
+    Agent["ReAct investigation agent:<br/>list papers, search more,<br/>fetch full text, RAG-search<br/>chunks, analyze papers"] --> AgentOK{"Answered within its<br/>tool-call budget?"}
+    AgentOK -->|Yes| Cite
+    AgentOK -->|"No / error - fall back"| Chat
+
+    Chat["Answer from the session's<br/>existing evidence (+ any new file)"] --> Cite
+
+    Synthesize["Genre-adaptive answer:<br/>question, rewrite, or deliverable"] --> YesNo{"Yes/no research<br/>question?"}
+    YesNo -->|Yes| Meter["Generate the Atelier Meter"]
+    YesNo -->|No| Cite
+    Meter --> Cite["Renumber citations by order<br/>of appearance, save the turn"]
+
+    Upload --> HasQuestion{"A question asked<br/>alongside the upload?"}
+    HasQuestion -->|Yes| Chat
+    HasQuestion -->|No| Confirm["Confirm what was added -<br/>no LLM answer needed"]
+
+    Cite --> Render(["Render in the feed"])
+    Confirm --> Render
+```
+
+A few of the less obvious decision points:
+
+* **A first message with both an attachment and a real question runs a real search too** - it doesn't just answer from the upload. An uploaded document enriches the literature search (grey literature/project briefs journals won't have), it doesn't replace one that should have happened.
+* **`route_intent`'s "needs new evidence" guess isn't final** - before committing to a full external search, it checks whether papers the original search already found but ranked too low to extract happen to cover the follow-up, and reclassifies as CHAT/INVESTIGATE if so. Much cheaper than a fresh multi-engine search, and only spent when the cheap classification already leans that way.
+* **The investigation agent isn't the only INVESTIGATE outcome** - if it hits its tool-call budget or errors out, it falls back to a plain context-aware answer instead of surfacing a dead end.
+* **The Atelier Meter is opportunistic, not automatic** - only yes/no-shaped questions get one; everything else skips straight to citation rendering.
 
 ## 🏗️ Architecture Overview
 

@@ -449,34 +449,36 @@ class AtelierRepository:
             return out
 
     @staticmethod
-    def update_record_ai_data(session_id: str, pmid: str, ai_data: dict) -> None:
+    def update_record_ai_data(session_id: str, fingerprint: str, ai_data: dict) -> None:
         """
         Permanently saves the LLM's expensive extraction work to the database.
         These parameters are immutable facts about the paper.
 
         Args:
             session_id (str): The active session (used for logging context).
-            pmid (str): The PubMed ID (or source ID) of the paper.
+            fingerprint (str): The paper's fingerprint - the DB's own unique
+                dedup key (doi:/pmid:/pmcid:/arxiv:/{source}:{source_id}, see
+                core.utils.make_fingerprint). NOT pmid: this used to look up
+                by PaperModel.pmid, which is genuinely None for most
+                non-PubMed-sourced papers (Crossref, arXiv, OpenAlex, and
+                Semantic Scholar records routinely have no PubMed
+                cross-reference at all) - confirmed live against the real
+                DB that every successfully-saved extraction had a non-null
+                pmid, meaning extraction for EVERY paper without one was
+                silently discarded here the whole time (the lookup found
+                nothing, logged a warning, and returned) even though the
+                LLM call itself had already succeeded. fingerprint is always
+                set and is the actual unique column, so this can never
+                ambiguously match more than one row the way pmid could.
             ai_data (dict): The extracted JSON metadata from the AI Engine.
         """
         with get_db_session() as db:
-            # pmid isn't a unique column (only fingerprint is) - the same
-            # real-world paper can legitimately end up as more than one row
-            # if different engines surfaced it under different fingerprint
-            # prefixes (e.g. PubMed's "pmid:..." vs Crossref/OpenAlex's
-            # "doi:..." for the identical paper). scalar_one_or_none() would
-            # correctly refuse to guess among duplicates and raise
-            # MultipleResultsFound - .first() instead updates whichever
-            # matching row comes back first, deliberately tolerant here
-            # since silently skipping the save (as the old Peewee .get()
-            # equally arbitrary "first match" behavior effectively also did)
-            # is worse than picking one.
             paper = db.execute(
-                select(PaperModel).where(PaperModel.pmid == str(pmid)).limit(1)
-            ).scalars().first()
+                select(PaperModel).where(PaperModel.fingerprint == fingerprint)
+            ).scalar_one_or_none()
 
             if paper is None:
-                logger.warning(f"Could not save AI data: Paper with PMID {pmid} not found in DB.")
+                logger.warning(f"Could not save AI data: Paper with fingerprint {fingerprint} not found in DB.")
                 return
 
             # Map the JSON schema to the database columns
@@ -996,6 +998,41 @@ class AtelierRepository:
         except Exception as e:
             logger.error(f"Error fetching chat history: {e}")
             return []
+
+    @staticmethod
+    def get_session_chat_history_as_messages(session_id: str) -> List[Dict[str, str]]:
+        """
+        Flattens get_session_chat_history's QueryModel-shaped rows into the
+        plain {"role": "user"/"assistant", "content": ...} message list
+        llm.engine.chat_with_literature / pipeline.agent.run_investigation
+        actually expect.
+
+        Used as a DB fallback wherever store-chat-history (a memory-only
+        Dash Store - see ui/layouts/main.py's serve_layout) doesn't yet
+        reflect the session's real history. That Store has two independent
+        gaps, not just one: it resets to [] on every reload (already
+        handled elsewhere the same way route_intent falls back to the DB
+        for current_topic/processed_records), AND - more subtly - it never
+        gets the session's very FIRST turn written into it at all, reload
+        or not: ui/callbacks/search.py's generate_synth (the initial
+        SEARCH turn) never writes chat_history, only run_chat/
+        run_investigation/run_upload do, and only once one of THOSE has
+        already run at least once. Confirmed live: a user's first-ever
+        follow-up right after an initial search ("rewrite the above
+        with...") got an LLM response acting as if no prior turn existed,
+        because store-chat-history genuinely was still [] at that exact
+        point - not stale, never populated in the first place.
+        """
+        history = AtelierRepository.get_session_chat_history(session_id)
+        messages: List[Dict[str, str]] = []
+        for turn in history:
+            prompt = turn.get('prompt')
+            synthesis = turn.get('synthesis')
+            if prompt:
+                messages.append({"role": "user", "content": prompt})
+            if synthesis:
+                messages.append({"role": "assistant", "content": synthesis})
+        return messages
 
     @staticmethod
     def save_query_with_citations(session_id: str, prompt: str, synthesis: str, model_used: str, cited_records: List[Record], consensus_meter: dict = None) -> Optional[int]:

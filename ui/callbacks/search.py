@@ -1,3 +1,4 @@
+import base64
 import dash
 import logging
 import uuid
@@ -9,6 +10,7 @@ from database import AtelierRepository, Record
 from database.models import SessionModel
 from llm import AtelierAIEngine
 from pipeline import ResearchOrchestrator
+from pipeline.uploads import ingest_uploaded_documents
 from ui.layouts import build_atelier_meter, build_failed_placeholder, build_flow_header, build_loading_skeleton, build_paper_cards, build_search_warning_banner, build_synthesis_body
 from .background import background_manager
 
@@ -20,12 +22,43 @@ logger = logging.getLogger(__name__)
     Output('store-current-topic', 'data', allow_duplicate=True),
     Output('store-processed-records', 'data', allow_duplicate=True),
     Output('store-chat-history', 'data', allow_duplicate=True),
+    Output('trigger-upload', 'data', allow_duplicate=True),
+    Output('store-pending-uploads', 'data', allow_duplicate=True),
+    Output('pending-uploads-container', 'children', allow_duplicate=True),
+    Output('trigger-router', 'data', allow_duplicate=True),
     Input('hero-search-btn', 'n_clicks'),
     State('hero-search-input', 'value'),
     State('hero-llm-dropdown', 'value'),
+    State('store-pending-uploads', 'data'),
+    # Dash's own running-state mechanism, not a hand-rolled clientside
+    # callback - these Outputs apply the INSTANT the button is clicked
+    # (before this function even starts running server-side), and revert
+    # automatically once it returns. Without this, clicking "Synthesize"
+    # gave no feedback at all until the redirect to /history/<id> actually
+    # landed and the feed page's own "Analyzing query intent..." skeleton
+    # rendered - a real, if brief, dead-feeling gap between click and any
+    # visible response. This function itself is fast (no I/O - see its own
+    # docstring), so what actually keeps the spinner up long enough to be
+    # useful is the follow-on network round trip for the redirect itself
+    # plus the feed page's initial render, not this callback's own runtime.
+    running=[
+        (Output('hero-search-btn', 'disabled'), True, False),
+        (Output('hero-search-input', 'disabled'), True, False),
+        (
+            Output('hero-search-btn', 'children'),
+            [
+                html.Span("Starting...", className="font-bold text-xs md:text-sm tracking-widest uppercase"),
+                html.Span("autorenew", className="material-symbols-outlined text-lg animate-spin"),
+            ],
+            [
+                html.Span("Synthesize", className="font-bold text-xs md:text-sm tracking-widest uppercase"),
+                html.Span("arrow_forward", className="material-symbols-outlined text-lg"),
+            ],
+        ),
+    ],
     prevent_initial_call=True
 )
-def create_new_session(hero_clicks, hero_text, hero_llm):
+def create_new_session(hero_clicks, hero_text, hero_llm, pending_uploads):
     """
     Fires when a user initiates a search from the Home Page. Creates the
     session row immediately (STATUS_IN_PROGRESS) - not backgrounded, since
@@ -34,17 +67,99 @@ def create_new_session(hero_clicks, hero_text, hero_llm):
     right away instead of only appearing once the pipeline's first node
     finally gets around to it, and writes the new query to the pending
     clipboard, then redirects to the new Feed view.
+
+    Allows submission with just an attachment and no typed text - mirrors
+    ui/callbacks/chat.py's handle_feed_interactions Scenario B, which
+    already allows this on a follow-up; a brand-new session should work
+    the same way rather than forcing text just because it's the FIRST
+    turn.
+
+    Attachments are dispatched DIRECTLY from right here (not left for
+    handle_feed_interactions' Scenario A to pick up once the feed page
+    mounts, which is how this worked previously) - store-pending-uploads
+    only needs to be READ here, as a State, at the moment this callback
+    already has it in hand; it never needs to carry the raw file bytes
+    across the redirect to /history/<id> via any browser storage
+    mechanism. That distinction matters: it used to, briefly, ride across
+    that navigation in sessionStorage (see store-pending-uploads'
+    docstring in ui/layouts/main.py's serve_layout), which has a hard
+    ~5-10MB per-origin quota - confirmed live that attaching a real PDF
+    threw "Failed to execute 'setItem'... exceeded the quota" immediately,
+    since a base64-encoded file is ~33% larger than the original and even
+    a modest PDF blows past that ceiling on its own.
+
+    Two different destinations depending on whether there's also a real
+    question, not just one attach-handling path for both:
+    - Attachment ALONE, no text: trigger-upload directly - there's no
+      research topic to search for, so this is purely "add this document
+      to my evidence pool."
+    - Attachment PLUS a real question: trigger-router (same as a
+      plain-text-only submission), carrying `files` in the payload -
+      route_intent (a brand-new session always resolves to SEARCH, having
+      no prior context yet) forwards it to run_search, which folds the
+      attachment into the SAME processed_records the search itself
+      produces. Answering from the upload ALONE here - the original
+      behavior - was the wrong default: a session whose very first turn
+      is "attach a document and ask a real question" never ran a
+      literature search at all, confirmed live as the actual cause of a
+      report that "only dwelt on the PDFs, no additional data from the
+      journals" - the vision is for an upload to enrich a real search
+      (grey literature/project briefs journals won't have), not replace
+      one that should have happened.
+
+    set_session_progress is called for the attach-only branch (not just
+    inside run_upload's own report() closure) so layout_feed()'s
+    server-side initial render - which happens the INSTANT the redirect
+    below lands, before run_upload's background job has necessarily even
+    started - already shows a real, upload-specific status instead of a
+    flash of the generic "still working on this" placeholder. The
+    attach-plus-question branch doesn't need the equivalent: run_search's
+    own report() closure already persists progress via the same
+    mechanism, same as any plain-text search.
     """
-    if not hero_clicks or not hero_text or not hero_text.strip():
-        return [no_update] * 5
+    has_text = bool(hero_text and hero_text.strip())
+    has_uploads = bool(pending_uploads)
+    if not hero_clicks or (not has_text and not has_uploads):
+        return [no_update] * 9
 
     new_session_id = str(uuid.uuid4())[:8]
-    topic = hero_text.strip()
-    AtelierRepository.create_session(new_session_id, topic, "")
+    query = hero_text.strip() if has_text else ""
 
-    trigger_data = {"query": topic, "llm": hero_llm, "session_id": new_session_id}
+    if has_uploads and has_text:
+        AtelierRepository.create_session(new_session_id, query, "")
+        existing_flows = [build_loading_skeleton(query, "Analyzing query intent...")]
+        router_payload = {
+            "query": query, "llm": hero_llm, "session_id": new_session_id,
+            "existing_flows": existing_flows, "files": pending_uploads,
+        }
+        # url, clear clipboard (dispatching trigger-router directly
+        # instead), clear topic/records/history stores, no trigger-upload,
+        # clear staged uploads + their chip row, trigger router
+        return f"/history/{new_session_id}", None, "", [], [], no_update, [], [], router_payload
 
-    return f"/history/{new_session_id}", trigger_data, "", [], []
+    if has_uploads:
+        # No text at all - fall back to a filename-derived label so the
+        # session still gets a real, readable title in the sidebar/history
+        # instead of an empty one.
+        names = [f.get("filename", "file") for f in pending_uploads]
+        topic = f"Attached: {', '.join(names)}"
+        AtelierRepository.create_session(new_session_id, topic, "")
+
+        label = "Processing attached document(s)..."
+        AtelierRepository.set_session_progress(new_session_id, label)
+        existing_flows = [build_loading_skeleton("Processing attachments...", label, icon="upload_file", spin=False)]
+        upload_payload = {
+            "query": "", "llm": hero_llm, "session_id": new_session_id,
+            "existing_flows": existing_flows, "files": pending_uploads,
+        }
+        # url, clear clipboard, clear topic/records/history stores,
+        # trigger upload, clear staged uploads + their chip row, no
+        # trigger-router
+        return f"/history/{new_session_id}", None, "", [], [], upload_payload, [], [], no_update
+
+    AtelierRepository.create_session(new_session_id, query, "")
+    trigger_data = {"query": query, "llm": hero_llm, "session_id": new_session_id}
+    return f"/history/{new_session_id}", trigger_data, "", [], [], no_update, no_update, no_update, no_update
 
 @callback(
     Output('trigger-synthesis', 'data', allow_duplicate=True),
@@ -147,6 +262,41 @@ def run_search(set_progress, search_data):
     if warning_banner:
         existing_flows.append(warning_banner)
 
+    # Any file(s) attached alongside this query (create_new_session,
+    # ui/callbacks/search.py - a brand-new session started with BOTH an
+    # attachment and a real question) get folded into the SAME
+    # processed_records the search just built, not answered from
+    # exclusively - a session whose first-ever turn is "attach + ask a
+    # question" used to skip search entirely and answer from the upload
+    # alone, no real literature involved at all. That's the wrong default:
+    # an uploaded document should ENRICH the literature search (grey
+    # literature/project briefs journals won't have), not replace it - see
+    # create_new_session's docstring. Attach-only (no question at all)
+    # still bypasses this file entirely and goes straight to run_upload
+    # (ui/callbacks/uploads.py) instead - there's no topic to search for
+    # in that case.
+    files_payload = search_data.get('files') or []
+    if files_payload:
+        existing_flows.append(build_loading_skeleton(query, "Processing attached document(s)...", icon="upload_file", spin=False))
+        decoded_files = []
+        for f in files_payload:
+            filename = f.get("filename") or "file"
+            content = f.get("content") or ""
+            try:
+                _header, b64data = content.split(",", 1)
+                decoded_files.append((filename, base64.b64decode(b64data)))
+            except Exception as e:
+                logger.warning(f"Could not decode uploaded file '{filename}': {e}")
+        if decoded_files:
+            uploaded_records, failed = ingest_uploaded_documents(
+                session_id=session_id, files=decoded_files, topic=query,
+                model_choice=selected_llm, report=report,
+            )
+            processed_records = processed_records + uploaded_records
+            if failed:
+                logger.warning(f"Couldn't process attached file(s) for session {session_id}: {', '.join(failed)}")
+        existing_flows.pop()  # remove the "Processing attached..." skeleton before the next stage's own
+
     existing_flows.append(build_loading_skeleton(query, "Synthesizing AI consensus...", icon="auto_awesome"))
 
     # Pass processed_records AND existing_flows forward so generate_synth
@@ -165,11 +315,21 @@ def run_search(set_progress, search_data):
 )
 def generate_synth(synth_data):
     """
-    Generates the final structured synthesis markdown document based on the
-    extracted paper logic. Completes the SEARCH flow, marking the session
-    STATUS_COMPLETED (or STATUS_FAILED if something goes wrong here) so the
-    sidebar/history status icons and the feed's resume-on-navigate logic
-    reflect reality.
+    Generates the synthesis markdown for a session's very first query.
+    Completes the SEARCH flow, marking the session STATUS_COMPLETED (or
+    STATUS_FAILED if something goes wrong here) so the sidebar/history
+    status icons and the feed's resume-on-navigate logic reflect reality.
+
+    Calls engine.chat_with_literature - the SAME entry point every
+    follow-up (run_chat/run_investigation/run_upload, ui/callbacks/chat.py
+    /uploads.py) goes through, with chat_history seeded to just this one
+    user turn (no prior AI message yet). A first query used to get forced
+    through a separate, fixed 4-header abstract template
+    (generate_copilot_synthesis, since removed) regardless of how it was
+    phrased - now "write a 5000-word report on X" as your FIRST message
+    gets treated as the written-deliverable request it actually is, the
+    same as it would as a follow-up, instead of only becoming
+    genre-aware starting on turn two.
 
     Writes flow-container/store-synthesis-markdown through
     pending-flow-update, not directly - see run_search's docstring and
@@ -196,13 +356,16 @@ def generate_synth(synth_data):
 
     try:
         engine = AtelierAIEngine(model_choice=selected_llm)
-        raw_md = engine.generate_copilot_synthesis(topic=query, valid_records=processed_records)
+        raw_md = engine.chat_with_literature(
+            chat_history=[{"role": "user", "content": query}],
+            context_records=processed_records,
+        )
 
         # Renumber [N] citations by the order they actually appear in the
         # text, not the relevance-rank order they were pre-assigned in
-        # before the LLM wrote anything (generate_copilot_synthesis cites
-        # using indices matching processed_records' existing order, and the
-        # LLM's narrative doesn't necessarily follow that same order) - see
+        # before the LLM wrote anything (chat_with_literature cites using
+        # indices matching context_records' existing order, and the LLM's
+        # narrative doesn't necessarily follow that same order) - see
         # core.utils.order_citations_by_appearance's docstring. Reorders
         # processed_records to match, BEFORE generate_atelier_meter below,
         # since the meter's own paper_index positions need to line up with

@@ -25,11 +25,21 @@ app = dash.Dash(__name__, title="Atelier", suppress_callback_exceptions=True)
 
 app.index_string = index_string
 
-# Bind the auto-resize JS to the search text area
+# Bind the auto-resize JS to both the feed's follow-up textarea and the
+# home page's hero textarea - same clientside function (ui/layouts/main.py's
+# resizeTextarea reads WHICH element triggered it), two separate bindings
+# since a Dash Output can only be one specific component. Previously only
+# ever bound to search-input, so the home page's textarea never
+# auto-resized at all.
 clientside_callback(
     ClientsideFunction(namespace='ui', function_name='resizeTextarea'),
     Output('search-input', 'style'),
     Input('search-input', 'value')
+)
+clientside_callback(
+    ClientsideFunction(namespace='ui', function_name='resizeTextarea'),
+    Output('hero-search-input', 'style'),
+    Input('hero-search-input', 'value')
 )
 
 # Mobile drawer sidebar: hamburger opens it, its own close button or a
@@ -67,6 +77,7 @@ import ui.callbacks.router
 import ui.callbacks.search
 import ui.callbacks.settings
 import ui.callbacks.ui_extras
+import ui.callbacks.uploads
 
 if __name__ == '__main__':
     # Only the true server process ever reaches this guard - a spawned

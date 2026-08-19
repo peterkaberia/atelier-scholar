@@ -109,17 +109,43 @@ def layout_feed(session_id: str, pending_search: dict = None):
         html.Div(id="bottom-bar-container", className="absolute bottom-6 left-1/2 -translate-x-1/2 w-full max-w-4xl px-4 md:px-6 z-[100]", children=[
             html.Div(className="glass-chat-bar rounded-3xl p-4 md:p-6 flex flex-col transition-all duration-300", children=[
                 html.Div(id="selected-papers-container", className="flex items-center mb-4 px-1 gap-2 md:gap-3 overflow-x-auto no-scrollbar empty:hidden"),
+                # Files staged via the paperclip control below but not yet
+                # sent - see ui/callbacks/uploads.py's stage_uploads for
+                # why staging is a separate step from actually processing
+                # them.
+                html.Div(id="pending-uploads-container", className="flex items-center mb-4 px-1 gap-2 md:gap-3 overflow-x-auto no-scrollbar empty:hidden"),
                 html.Div(className="flex items-center w-full px-1 mb-3", children=[
                     dcc.Textarea(
                         id="search-input", 
-                        className="w-full bg-transparent border-none text-slate-800 placeholder-slate-400 focus:ring-0 text-[16px] md:text-[17px] font-medium py-1 outline-none resize-none min-h-[24px] max-h-[120px] leading-relaxed", 
+                        className="w-full bg-transparent border-none text-slate-800 placeholder-slate-400 focus:ring-0 text-[16px] md:text-[17px] font-medium py-1 outline-none resize-none min-h-[24px] max-h-[45vh] leading-relaxed overflow-y-auto",
                         placeholder="Ask follow up or request a deep dive...", rows=1
                     )
                 ]),
                 
                 html.Div(className="flex items-center justify-between px-1", children=[
                     html.Div(className="flex items-center space-x-1", children=[
-                        html.Button(html.Span("attach_file", className="material-symbols-outlined text-2xl"), className="p-2 text-slate-400 hover:text-primary transition-colors hover:bg-slate-100/50 rounded-lg")
+                        # dcc.Upload, not a plain button - a plain
+                        # html.Button has no way to actually open a file
+                        # picker/receive file data. Styled to look exactly
+                        # like the icon-only button it replaces; the
+                        # dashed-drop-zone look that's dcc.Upload's default
+                        # is opted out of entirely by fully overriding
+                        # `children` (see this component's `style` prop is
+                        # deliberately left unset - CSS module default
+                        # padding/border would otherwise show through).
+                        # multiple=True: uploading several files in one
+                        # picker use is expected UX (comparing multiple
+                        # documents at once), not one-at-a-time.
+                        dcc.Upload(
+                            id='file-upload',
+                            multiple=True,
+                            accept=".pdf,.txt,.md,.markdown",
+                            className="inline-flex",
+                            children=html.Div(
+                                html.Span("attach_file", className="material-symbols-outlined text-2xl"),
+                                className="p-2 text-slate-400 hover:text-primary transition-colors hover:bg-slate-100/50 rounded-lg cursor-pointer",
+                            ),
+                        )
                     ]),
                     html.Div(className="flex items-center space-x-3", children=[
                         html.Div(className="relative group", children=[

@@ -41,13 +41,64 @@ index_string = '''
             // Register Clientside Callback for Auto-resizing the Textarea
             window.dash_clientside = Object.assign({}, window.dash_clientside, {
                 ui: {
+                    // Shared by BOTH the home page's hero-search-input and
+                    // the feed's search-input (two separate
+                    // clientside_callback registrations in app.py, same
+                    // function) - previously only ever bound to
+                    // search-input, so the home page's textarea never
+                    // auto-resized at all (stuck at its native single-row
+                    // height no matter how much you typed). Reads WHICH
+                    // element actually triggered this from
+                    // dash_clientside.callback_context instead of a
+                    // hardcoded id, so one function serves both.
+                    //
+                    // Cap is viewport-relative (45% of window height), not
+                    // a small fixed pixel value - a composer that can only
+                    // grow to ~120px forces a scrollbar almost immediately
+                    // on anything longer than a couple of sentences (e.g.
+                    // pasting a paragraph to rewrite, or a multi-part
+                    // question) - confirmed as a real complaint, with a
+                    // reference screenshot of another tool's composer
+                    // comfortably growing several times taller before its
+                    // own internal scrollbar ever appears.
                     resizeTextarea: function(value) {
-                        var el = document.getElementById('search-input');
-                        if(el) {
+                        try {
+                            var ctx = window.dash_clientside.callback_context;
+                            var triggeredId = (ctx && ctx.triggered && ctx.triggered.length) ? ctx.triggered[0].prop_id.split('.')[0] : null;
+                            var el = triggeredId ? document.getElementById(triggeredId) : null;
+                            if (!el) return window.dash_clientside.no_update;
+
+                            // The 'auto' reset here is purely to MEASURE
+                            // scrollHeight correctly (a shrinking paste/edit
+                            // needs the element to first collapse back to
+                            // its natural size before re-measuring, or
+                            // scrollHeight would still reflect the OLD,
+                            // larger height) - transient, synchronous, and
+                            // immediately corrected below before any
+                            // repaint, not the field's persisted state.
+                            var previousHeight = el.style.height;
                             el.style.height = 'auto';
-                            el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+                            var maxHeight = window.innerHeight * 0.45;
+                            var newHeight = Math.min(el.scrollHeight, maxHeight) + 'px';
+                            el.style.height = previousHeight; // restore before Dash applies the real Output below
+
+                            // Returned as the Output's actual value (Dash's
+                            // own React reconciliation applies it), NOT
+                            // written directly to el.style here - a
+                            // controlled <textarea> whose DOM node is ALSO
+                            // being imperatively mutated outside React's
+                            // render cycle is a known source of the
+                            // element's real DOM value and React's tracked
+                            // value drifting out of sync, which can make
+                            // typing/pasting into it appear to silently do
+                            // nothing once React's next render reasserts
+                            // its own last-known state over the manual
+                            // edit. Letting Dash own the actual persisted
+                            // style avoids that race entirely.
+                            return {height: newHeight};
+                        } catch (e) {
+                            return window.dash_clientside.no_update;
                         }
-                        return window.dash_clientside.no_update;
                     },
                     // Slides the mobile drawer sidebar in/out and toggles its
                     // backdrop. Fired by either the hamburger button (open)
@@ -626,6 +677,29 @@ def serve_layout():
         dcc.Store(id='store-synthesis-markdown', data=""),
         dcc.Store(id='store-pending-search', storage_type='session'),
 
+        # Files staged via a paperclip control (ui/layouts/home.py's OR
+        # ui/layouts/feed.py's dcc.Upload - both share this one id/Store,
+        # only one is ever mounted at a time since home/feed are mutually
+        # exclusive routes) but not yet sent - cleared on every Send.
+        #
+        # Deliberately memory, NOT storage_type='session' like
+        # store-pending-search right above - this used to be 'session' so a
+        # file attached on the HOME page would survive the client-side
+        # route change to /history/<id>, but that meant the browser's
+        # sessionStorage had to hold the raw base64-encoded file content -
+        # confirmed live: sessionStorage's hard ~5-10MB per-origin quota
+        # (browser-imposed, not something Atelier can raise) means any
+        # real-sized PDF blew right through it, throwing "Failed to execute
+        # 'setItem'... exceeded the quota" the instant a file was staged.
+        # ui/callbacks/search.py's create_new_session now consumes staged
+        # uploads and dispatches trigger-upload DIRECTLY, in the same
+        # callback invocation that redirects - so the raw file bytes never
+        # need to survive the navigation via ANY browser storage mechanism
+        # at all, and this can go back to being page-session-only (a
+        # follow-up attached and sent from the feed page never needed
+        # cross-page survival regardless - it's answered on the SAME page).
+        dcc.Store(id='store-pending-uploads', data=[]),
+
         # Gate for every background-callback write that touches visible
         # feed content (flow-container) or follow-up context (topic/
         # processed records/chat history/synthesis) - route_intent,
@@ -649,6 +723,7 @@ def serve_layout():
         dcc.Store(id='trigger-synthesis', data=""),
         dcc.Store(id='trigger-chat', data=""),
         dcc.Store(id='trigger-investigate', data=""),
+        dcc.Store(id='trigger-upload', data=""),
 
         # MOBILE NAV TRIGGERS (see toggleMobileMenu/closeMobileMenuOnNav in app.py)
         dcc.Store(id='mobile-menu-toggle-dummy', data=0),

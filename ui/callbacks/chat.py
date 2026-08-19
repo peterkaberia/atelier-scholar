@@ -3,7 +3,7 @@ import dash
 import logging
 from dash import html, ALL, Input, Output, State, callback, no_update
 from core.logger import setup_global_logging
-from core.utils import order_citations_by_appearance
+from core.utils import extract_bracket_fingerprints, order_citations_by_appearance
 from database.repository import AtelierRepository
 from database.models import SessionModel
 from llm import AtelierAIEngine
@@ -62,37 +62,56 @@ def retry_failed_search(n_clicks_list, selected_llm):
 
 
 @callback(
-    Output('trigger-router', 'data', allow_duplicate=True), 
+    Output('trigger-router', 'data', allow_duplicate=True),
+    Output('trigger-upload', 'data', allow_duplicate=True),
     Output('flow-container', 'children', allow_duplicate=True),
     Output('search-input', 'value', allow_duplicate=True),
     Output('store-pending-search', 'data', allow_duplicate=True), # Clears clipboard
+    Output('store-pending-uploads', 'data', allow_duplicate=True),
+    Output('pending-uploads-container', 'children', allow_duplicate=True),
     Input('current-session-id', 'data'), # Fires when the feed page mounts
     Input('search-btn', 'n_clicks'),     # Fires from the bottom bar
     State('store-pending-search', 'data'),
     State('search-input', 'value'),
     State('llm-dropdown', 'value'),
     State('flow-container', 'children'),
+    State('store-pending-uploads', 'data'),
     prevent_initial_call=True
 )
-def handle_feed_interactions(session_id, bottom_clicks, pending_search, bottom_text, bottom_llm, existing_flows):
+def handle_feed_interactions(session_id, bottom_clicks, pending_search, bottom_text, bottom_llm, existing_flows, pending_uploads):
     """
     Acts as the entry point for AI generation within the Feed View.
     Handles two scenarios:
     A) The page just loaded and there is a query waiting in the clipboard.
-    B) The user typed a follow-up directly into the bottom chat bar.
+    B) The user typed a follow-up and/or attached file(s) via the bottom
+       chat bar's paperclip control (ui/layouts/feed.py's dcc.Upload,
+       staged into store-pending-uploads by ui/callbacks/uploads.py's
+       stage_uploads - see its docstring for the two-phase stage-then-send
+       UX).
 
     Deliberately NOT background=True: this does zero I/O (just reads Store
     state and appends a skeleton), so backgrounding it only adds dispatch
-    overhead - the actual slow work happens in route_intent/run_search
-    (still background=True), triggered synchronously from here.
+    overhead - the actual slow work happens in route_intent/run_search/
+    run_upload (still background=True), triggered synchronously from here.
     """
     ctx = dash.callback_context
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    
-    if not existing_flows: 
+
+    if not existing_flows:
         existing_flows = []
 
     # SCENARIO A: The Feed Page just loaded from a Home Page handoff
+    #
+    # Only ever handles the plain-SEARCH handoff (store-pending-search) -
+    # an attachment made on the HOME page (ui/layouts/home.py's dcc.Upload,
+    # same store/ids as the feed's) is dispatched to trigger-upload
+    # DIRECTLY by create_new_session (ui/callbacks/search.py) instead,
+    # before the redirect that lands here - see that function's own
+    # docstring for why (sessionStorage's quota made carrying the raw file
+    # bytes across THIS navigation impossible for any real-sized file).
+    # store-pending-uploads is therefore already empty by the time this
+    # fires for a home-page handoff, so there's nothing left for this
+    # scenario to do with it.
     if triggered_id == 'current-session-id':
         if pending_search and pending_search.get("session_id") == session_id:
             query = pending_search["query"]
@@ -108,13 +127,33 @@ def handle_feed_interactions(session_id, bottom_clicks, pending_search, bottom_t
             existing_flows = [build_loading_skeleton(query, "Analyzing query intent...")]
             # Trigger Router, Update flow, Clear bottom input, Clear clipboard
             router_payload = {"query": query, "llm": llm, "session_id": session_id, "existing_flows": existing_flows}
-            return router_payload, existing_flows, "", None
-        return [no_update] * 4
+            return router_payload, no_update, existing_flows, "", None, no_update, no_update
+        return [no_update] * 7
 
-    # SCENARIO B: User typed a follow-up query in the bottom bar
+    # SCENARIO B: User typed a follow-up and/or attached file(s)
     elif triggered_id == 'search-btn':
-        if not bottom_clicks or not bottom_text or not bottom_text.strip():
-            return [no_update] * 4
+        has_text = bool(bottom_text and bottom_text.strip())
+        has_uploads = bool(pending_uploads)
+        if not bottom_clicks or (not has_text and not has_uploads):
+            return [no_update] * 7
+
+        # Attachments take a SEPARATE path from the normal SEARCH/CHAT/
+        # INVESTIGATE router entirely - an uploaded document needs to be
+        # ingested (pipeline/uploads.py) unconditionally, regardless of
+        # what route_intent's LLM classifier would have guessed for the
+        # accompanying text, and even when there's no accompanying text at
+        # all (attach-only, no question - see run_upload's docstring for
+        # why that's a valid, distinct case, not force-routed through CHAT).
+        if has_uploads:
+            label = "Processing attached document(s)..." if not has_text else "Reading attachments and analyzing your question..."
+            existing_flows.append(build_loading_skeleton(bottom_text or "Processing attachments...", label, icon="upload_file", spin=False))
+            upload_payload = {
+                "query": bottom_text or "", "llm": bottom_llm, "session_id": session_id,
+                "existing_flows": existing_flows, "files": pending_uploads,
+            }
+            # Trigger upload, Update flow, Clear bottom input, leave
+            # clipboard alone, Clear staged uploads + their chip row
+            return no_update, upload_payload, existing_flows, "", no_update, [], []
 
         # Inject Skeleton Loader
         existing_flows.append(build_loading_skeleton(bottom_text, "Analyzing query intent..."))
@@ -126,9 +165,9 @@ def handle_feed_interactions(session_id, bottom_clicks, pending_search, bottom_t
         # before this callback's own flow-container write has actually been
         # applied by the client - see route_intent's docstring.
         router_payload = {"query": bottom_text, "llm": bottom_llm, "session_id": session_id, "existing_flows": existing_flows}
-        return router_payload, existing_flows, "", no_update
+        return router_payload, no_update, existing_flows, "", no_update, no_update, no_update
 
-    return [no_update] * 4
+    return [no_update] * 7
 
 @callback(
     Output('trigger-search', 'data', allow_duplicate=True),
@@ -137,12 +176,11 @@ def handle_feed_interactions(session_id, bottom_clicks, pending_search, bottom_t
     Output('pending-flow-update', 'data', allow_duplicate=True),
     Input('trigger-router', 'data'),
     State('store-current-topic', 'data'),
-    State('store-processed-records', 'data'),
     background=True,
     manager=background_manager(),
     prevent_initial_call=True
 )
-def route_intent(router_data, current_topic, processed_records):
+def route_intent(router_data, current_topic):
     """
     Context-Aware Intent Router.
     Determines if the user's query requires fetching new documents (SEARCH)
@@ -168,15 +206,33 @@ def route_intent(router_data, current_topic, processed_records):
     a downstream stage's existing_flows.pop()/append() operated on a list
     that didn't actually include what the previous stage had just added.
 
-    current_topic/processed_records fall back to the DB when the State
-    Stores are empty - store-current-topic/store-processed-records are
-    memory-only (see ui/layouts/main.py's serve_layout), so they reset to
-    empty on EVERY fresh page load/reload, regardless of whether the
-    session actually has prior context. Without this fallback, ANY
-    follow-up typed after simply reloading the page hit the "no context"
-    branch below and got force-routed to SEARCH - confirmed live: a
-    follow-up asking to "write an abstract with the info you have"
-    triggered a full new pipeline run instead of ever reaching CHAT.
+    current_topic falls back to the DB when the State Store is empty -
+    store-current-topic is memory-only (see ui/layouts/main.py's
+    serve_layout), so it resets to empty on EVERY fresh page load/reload,
+    regardless of whether the session actually has prior context. Without
+    this fallback, ANY follow-up typed after simply reloading the page hit
+    the "no context" branch below and got force-routed to SEARCH -
+    confirmed live: a follow-up asking to "write an abstract with the info
+    you have" triggered a full new pipeline run instead of ever reaching
+    CHAT.
+
+    processed_records is NOT read from State('store-processed-records')
+    at all anymore (a State param used to exist for exactly that) - that
+    Store is written ONLY by run_search, never by run_chat/
+    run_investigation/run_upload, so it went stale the moment ANY
+    non-SEARCH turn happened, even within the same tab with no reload at
+    all. The DB fallback that used to sit here had the same flaw in a
+    different shape: AtelierRepository.get_query_citations(last_query_id)
+    only recovers the SINGLE MOST RECENT turn's own citation set, not
+    everything the session has actually accumulated - confirmed live as
+    the cause of a real report: a session with both an uploaded document
+    and an earlier broad search only ever saw whichever ONE of those two
+    happened to be the most recent turn when a later follow-up asked to
+    combine both. get_session_processed_papers (below) is the session-WIDE
+    pool instead - the same source run_chat/run_investigation/run_upload's
+    own DB fallbacks already use - so this router's CHAT-vs-SEARCH
+    decision, and whatever context CHAT/INVESTIGATE ultimately receives,
+    reflects everything the session actually knows, not just its last turn.
     """
     # Every background=True callback runs in its own spawned subprocess
     # that never imports app.py - see run_search's identical call/comment
@@ -191,10 +247,10 @@ def route_intent(router_data, current_topic, processed_records):
 
     if not current_topic:
         current_topic = AtelierRepository.get_session_topic(session_id)
-    if not processed_records:
-        last_query_id = AtelierRepository.get_last_query_id(session_id)
-        if last_query_id:
-            processed_records = AtelierRepository.get_query_citations(last_query_id)
+    # Always the full session-wide pool - see this function's own
+    # docstring for why neither the live Store nor a single-turn DB
+    # lookup is enough on its own.
+    processed_records = [r.__dict__ for r in AtelierRepository.get_session_processed_papers(session_id, limit=100)]
 
     if not current_topic or not processed_records:
         route = "SEARCH"
@@ -244,7 +300,17 @@ def route_intent(router_data, current_topic, processed_records):
         # replaces this skeleton with live per-stage progress.
         existing_flows.append(build_loading_skeleton(search_query, "Planning your search..."))
         pending = {"session_id": session_id, "updates": {"flow_container": existing_flows}}
-        search_trigger = {"query": search_query, "llm": selected_llm, "session_id": session_id, "existing_flows": existing_flows}
+        # files passes through from router_data untouched (only ever
+        # actually populated when create_new_session dispatched here for
+        # a brand-new session started with an attachment PLUS a real
+        # question - see its docstring) - run_search folds any attached
+        # document(s) into the SAME processed_records the search itself
+        # produces, so a session's first-ever turn combines both instead
+        # of a real search never happening at all.
+        search_trigger = {
+            "query": search_query, "llm": selected_llm, "session_id": session_id,
+            "existing_flows": existing_flows, "files": router_data.get('files'),
+        }
         return search_trigger, no_update, no_update, pending
 
     elif "INVESTIGATE" in route:
@@ -329,8 +395,19 @@ def run_chat(chat_data, chat_history):
     processed_records = chat_data.get('processed_records') or []
 
     # Ensure memory structures exist
-    if chat_history is None: chat_history = []
     if existing_flows is None: existing_flows = []
+
+    # store-chat-history (a memory-only Dash Store) can be genuinely empty
+    # here even on a real, ongoing conversation - not just after a reload,
+    # but on the session's very FIRST follow-up ever, since the initial
+    # SEARCH turn (generate_synth, ui/callbacks/search.py) never writes to
+    # it at all. Falling back to the DB-reconstructed history the same way
+    # route_intent already falls back for current_topic/processed_records
+    # - see get_session_chat_history_as_messages's docstring. Confirmed
+    # live: without this, a user's first-ever "rewrite the above with..."
+    # follow-up got an LLM response acting as if no prior turn existed.
+    if not chat_history:
+        chat_history = AtelierRepository.get_session_chat_history_as_messages(session_id)
 
     # 2. Append user message to memory
     chat_history.append({"role": "user", "content": query})
@@ -462,8 +539,11 @@ def run_investigation(set_progress, investigate_data, chat_history):
     session_id = investigate_data.get('session_id')
     existing_flows = investigate_data.get('existing_flows') or []
 
-    if chat_history is None:
-        chat_history = []
+    # Falls back to the DB-reconstructed history when store-chat-history
+    # is empty - same reasoning as run_chat's identical fallback above,
+    # see get_session_chat_history_as_messages's docstring.
+    if not chat_history:
+        chat_history = AtelierRepository.get_session_chat_history_as_messages(session_id)
     chat_history.append({"role": "user", "content": query})
 
     def report(label: str):
@@ -498,10 +578,37 @@ def run_investigation(set_progress, investigate_data, chat_history):
         # sequential .replace() calls - both wrong, see that function's
         # docstring for why (citation order should follow the text, and
         # sequential replace() can corrupt overlapping renumberings).
-        candidates = [
-            (rec.fingerprint, rec.__dict__)
+        #
+        # get_session_processed_papers alone is NOT a complete candidate
+        # pool here: it only returns papers that went through full LLM
+        # EXTRACTION (PaperModel.answer != "-"), but the agent can - and
+        # routinely does - cite a paper it only engaged with via
+        # get_full_text/rag_search_chunks/analyze_papers
+        # (pipeline/agent_tools.py), none of which ever set `answer`. A
+        # paper cited that way was invisible to this matcher: its
+        # [doi:X] marker was left un-rewritten as raw bracket text in the
+        # final answer, AND it silently never made it into the References
+        # list - confirmed live via a report that genuinely cited 16 such
+        # papers, none of which appeared in its own exported PDF's
+        # References section. extract_bracket_fingerprints finds every
+        # fingerprint-SHAPED marker actually present in the answer text
+        # and resolves any not already covered above via
+        # get_paper_by_fingerprint, which (unlike
+        # get_session_processed_papers) has no such extraction
+        # requirement - it's the same lookup agent_tools.py itself uses to
+        # serve those tools in the first place.
+        known_records = {
+            rec.fingerprint: rec.__dict__
             for rec in AtelierRepository.get_session_processed_papers(session_id, limit=100)
-        ]
+        }
+        for marker in extract_bracket_fingerprints(result["answer"]):
+            if marker in known_records:
+                continue
+            rec_dict = AtelierRepository.get_paper_by_fingerprint(marker)
+            if rec_dict:
+                known_records[marker] = rec_dict
+
+        candidates = list(known_records.items())
         answer_text, valid_records = order_citations_by_appearance(result["answer"], candidates)
 
         new_query_id = AtelierRepository.save_query_with_citations(
