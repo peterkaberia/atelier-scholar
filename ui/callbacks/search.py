@@ -1,4 +1,3 @@
-import base64
 import dash
 import logging
 import uuid
@@ -10,7 +9,6 @@ from database import AtelierRepository, Record
 from database.models import SessionModel
 from llm import AtelierAIEngine
 from pipeline import ResearchOrchestrator
-from pipeline.uploads import ingest_uploaded_documents
 from ui.layouts import build_atelier_meter, build_failed_placeholder, build_flow_header, build_loading_skeleton, build_paper_cards, build_search_warning_banner, build_synthesis_body
 from .background import background_manager
 
@@ -95,10 +93,11 @@ def create_new_session(hero_clicks, hero_text, hero_llm, pending_uploads):
       to my evidence pool."
     - Attachment PLUS a real question: trigger-router (same as a
       plain-text-only submission), carrying `files` in the payload -
-      route_intent (a brand-new session always resolves to SEARCH, having
-      no prior context yet) forwards it to run_search, which folds the
-      attachment into the SAME processed_records the search itself
-      produces. Answering from the upload ALONE here - the original
+      route_intent (ui/callbacks/chat.py) ingests the attachment itself,
+      before classification, so it's already part of the session's
+      evidence pool by the time it decides SEARCH/CHAT/INVESTIGATE (a
+      brand-new session always resolves to SEARCH, having no prior
+      context yet). Answering from the upload ALONE here - the original
       behavior - was the wrong default: a session whose very first turn
       is "attach a document and ask a real question" never ran a
       literature search at all, confirmed live as the actual cause of a
@@ -262,40 +261,21 @@ def run_search(set_progress, search_data):
     if warning_banner:
         existing_flows.append(warning_banner)
 
-    # Any file(s) attached alongside this query (create_new_session,
-    # ui/callbacks/search.py - a brand-new session started with BOTH an
-    # attachment and a real question) get folded into the SAME
-    # processed_records the search just built, not answered from
-    # exclusively - a session whose first-ever turn is "attach + ask a
-    # question" used to skip search entirely and answer from the upload
-    # alone, no real literature involved at all. That's the wrong default:
-    # an uploaded document should ENRICH the literature search (grey
-    # literature/project briefs journals won't have), not replace it - see
-    # create_new_session's docstring. Attach-only (no question at all)
-    # still bypasses this file entirely and goes straight to run_upload
-    # (ui/callbacks/uploads.py) instead - there's no topic to search for
-    # in that case.
-    files_payload = search_data.get('files') or []
-    if files_payload:
-        existing_flows.append(build_loading_skeleton(query, "Processing attached document(s)...", icon="upload_file", spin=False))
-        decoded_files = []
-        for f in files_payload:
-            filename = f.get("filename") or "file"
-            content = f.get("content") or ""
-            try:
-                _header, b64data = content.split(",", 1)
-                decoded_files.append((filename, base64.b64decode(b64data)))
-            except Exception as e:
-                logger.warning(f"Could not decode uploaded file '{filename}': {e}")
-        if decoded_files:
-            uploaded_records, failed = ingest_uploaded_documents(
-                session_id=session_id, files=decoded_files, topic=query,
-                model_choice=selected_llm, report=report,
-            )
-            processed_records = processed_records + uploaded_records
-            if failed:
-                logger.warning(f"Couldn't process attached file(s) for session {session_id}: {', '.join(failed)}")
-        existing_flows.pop()  # remove the "Processing attached..." skeleton before the next stage's own
+    # Merge in the session's full evidence pool - execute_full_search_
+    # pipeline's own processed_records only ever reflects genuinely NEW
+    # papers THIS search run found and extracted (its candidate pool
+    # explicitly excludes anything already processed), so a document
+    # ui/callbacks/chat.py's route_intent ingested from a file attached to
+    # THIS turn (before ever dispatching here) - or anything from an
+    # earlier turn in this same session - would otherwise never reach
+    # generate_synth at all. Deduplicated by fingerprint: a paper this
+    # search found and one already in the session pool could in principle
+    # be the exact same one.
+    seen_fingerprints = {r.get('fingerprint') for r in processed_records if r.get('fingerprint')}
+    for rec in AtelierRepository.get_session_processed_papers(session_id, limit=100):
+        if rec.fingerprint not in seen_fingerprints:
+            processed_records.append(rec.__dict__)
+            seen_fingerprints.add(rec.fingerprint)
 
     existing_flows.append(build_loading_skeleton(query, "Synthesizing AI consensus...", icon="auto_awesome"))
 
@@ -409,7 +389,7 @@ def generate_synth(synth_data):
 
     existing_flows.pop()
     existing_flows.append(html.Div(className="flow-block border-t border-slate-100", children=[
-        build_flow_header(query, selected_llm, f"{len(processed_records)} References", query_id=new_query_id),
+        build_flow_header(query, selected_llm, f"{len(processed_records)} References", query_id=new_query_id, synthesis_text=raw_md),
         build_atelier_meter(meter),
         build_synthesis_body(raw_md, title="Abstract", valid_records=processed_records),
         build_paper_cards(processed_records, query_id=new_query_id, session_id=session_id)

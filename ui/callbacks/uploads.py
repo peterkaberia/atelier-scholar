@@ -234,7 +234,7 @@ def run_upload(set_progress, upload_data, chat_history):
                 model_used=selected_llm, cited_records=cited_records,
             )
             new_flow = html.Div(className="flow-block border-t border-slate-100", children=[
-                build_flow_header(query, selected_llm, f"{len(cited_records)} Context Papers", query_id=new_query_id),
+                build_flow_header(query, selected_llm, f"{len(cited_records)} Context Papers", query_id=new_query_id, synthesis_text=ai_response),
                 build_synthesis_body(ai_response, valid_records=cited_records),
                 build_paper_cards(cited_records, query_id=new_query_id, session_id=session_id),
             ])
@@ -254,7 +254,7 @@ def run_upload(set_progress, upload_data, chat_history):
                 model_used=selected_llm, cited_records=processed,
             )
             new_flow = html.Div(className="flow-block border-t border-slate-100", children=[
-                build_flow_header(title, selected_llm, f"{len(processed)} New Papers", query_id=new_query_id),
+                build_flow_header(title, selected_llm, f"{len(processed)} New Papers", query_id=new_query_id, synthesis_text=summary_md),
                 build_synthesis_body(summary_md, title="Documents Added", valid_records=processed),
                 build_paper_cards(processed, query_id=new_query_id, session_id=session_id),
             ])

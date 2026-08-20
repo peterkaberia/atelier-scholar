@@ -1,10 +1,11 @@
 import logging
+import re
 
 import dash
 from dash import ALL, MATCH, Input, Output, State, callback, dcc, html, no_update
 
 from core.export import build_bibtex, build_ris
-from core.pdf_export import build_turn_pdf
+from core.pdf_export import build_turn_pdf, derive_document_title
 from database.repository import AtelierRepository
 from llm import AtelierAIEngine
 from llm.utils import get_model_choices
@@ -397,5 +398,7 @@ def export_pdf(n_clicks_list):
         records=records,
     )
 
-    filename = f"atelier-{qid_int}.pdf"
+    doc_title = derive_document_title(query_info["synthesis"], query_info["prompt"])
+    slug = re.sub(r"[^a-z0-9]+", "-", doc_title.lower()).strip("-")[:60] or "report"
+    filename = f"{slug}-{qid_int}.pdf"
     return dcc.send_bytes(pdf_bytes, filename)

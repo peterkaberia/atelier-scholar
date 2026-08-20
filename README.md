@@ -108,21 +108,16 @@ Every question - your first one or a tenth follow-up, typed or attached as a doc
 
 ```mermaid
 flowchart TD
-    Start(["User submits a question"]) --> Origin{"Home page or an<br/>existing session?"}
+    Start(["User submits a question"]) --> FilesOnly{"Files attached, but<br/>no question at all?"}
 
-    Origin -->|"Home page (new session)"| HomeFiles{"Files attached?"}
-    Origin -->|"Existing session (follow-up)"| FeedFiles{"Files attached?"}
+    FilesOnly -->|Yes| Upload["Ingest file(s), fold into<br/>the session's evidence pool"]
+    Upload --> Confirm["Confirm what was added -<br/>no question was asked,<br/>so no LLM answer needed"]
 
-    HomeFiles -->|No| Search
-    HomeFiles -->|"Files only, no question"| Upload["Ingest file(s), fold into<br/>the session's evidence pool"]
-    HomeFiles -->|"Files + a question"| Search
+    FilesOnly -->|"No - has a question<br/>(with or without a file attached)"| Route["route_intent: ingest any<br/>attached file(s) FIRST -<br/>they're part of the evidence<br/>pool for whichever route wins"]
 
-    FeedFiles -->|Yes| Upload
-    FeedFiles -->|No| Route
-
-    Route{"route_intent: does this<br/>session already have<br/>papers &amp; a topic?"}
-    Route -->|"No prior context yet"| Search
-    Route -->|Yes| Classify{"LLM classifies<br/>the request"}
+    Route --> HasContext{"Does this session already<br/>have papers &amp; a topic?"}
+    HasContext -->|"No prior context yet"| Search
+    HasContext -->|Yes| Classify{"LLM classifies<br/>the request"}
 
     Classify -->|"needs new evidence"| CheckLocal{"Already-fetched papers<br/>cover it?"}
     Classify -->|"question / rewrite / deliverable"| Chat
@@ -143,25 +138,19 @@ flowchart TD
         EnoughRelevant -->|"No (retries left)"| Broaden
     end
 
-    EnoughRelevant -->|"Yes, or out of retries"| MergeUpload{"Files also attached<br/>to this turn?"}
-    MergeUpload -->|Yes| Merge["Ingest &amp; fold into<br/>the same evidence pool"]
-    MergeUpload -->|No| Synthesize
+    EnoughRelevant -->|"Yes, or out of retries"| Merge["Merge in the session's full<br/>evidence pool (dedup by<br/>fingerprint) - includes anything<br/>route_intent just ingested"]
     Merge --> Synthesize
 
     Agent["ReAct investigation agent:<br/>list papers, search more,<br/>fetch full text, RAG-search<br/>chunks, analyze papers"] --> AgentOK{"Answered within its<br/>tool-call budget?"}
     AgentOK -->|Yes| Cite
     AgentOK -->|"No / error - fall back"| Chat
 
-    Chat["Answer from the session's<br/>existing evidence (+ any new file)"] --> Cite
+    Chat["Answer from the session's<br/>existing evidence"] --> Cite
 
     Synthesize["Genre-adaptive answer:<br/>question, rewrite, or deliverable"] --> YesNo{"Yes/no research<br/>question?"}
     YesNo -->|Yes| Meter["Generate the Atelier Meter"]
     YesNo -->|No| Cite
     Meter --> Cite["Renumber citations by order<br/>of appearance, save the turn"]
-
-    Upload --> HasQuestion{"A question asked<br/>alongside the upload?"}
-    HasQuestion -->|Yes| Chat
-    HasQuestion -->|No| Confirm["Confirm what was added -<br/>no LLM answer needed"]
 
     Cite --> Render(["Render in the feed"])
     Confirm --> Render
@@ -169,7 +158,8 @@ flowchart TD
 
 A few of the less obvious decision points:
 
-* **A first message with both an attachment and a real question runs a real search too** - it doesn't just answer from the upload. An uploaded document enriches the literature search (grey literature/project briefs journals won't have), it doesn't replace one that should have happened.
+* **An attachment doesn't get its own separate answering path** - whether it's your first message on a brand-new session or the tenth follow-up on an existing one, attaching a file alongside a real question makes NO difference to which route can be taken: the file is ingested by `route_intent` itself, before it decides anything, so it's already part of the evidence pool no matter which route wins - including SEARCH. Attaching a document is never a dead end that traps you answering from that file alone; it's just more evidence added to whatever the normal decision tree already does.
+* **Attach-only (no question at all) is the one genuine exception** - with nothing to route or search for, it goes straight to ingestion and a confirmation, whether this is a brand-new session or a follow-up.
 * **`route_intent`'s "needs new evidence" guess isn't final** - before committing to a full external search, it checks whether papers the original search already found but ranked too low to extract happen to cover the follow-up, and reclassifies as CHAT/INVESTIGATE if so. Much cheaper than a fresh multi-engine search, and only spent when the cheap classification already leans that way.
 * **The investigation agent isn't the only INVESTIGATE outcome** - if it hits its tool-call budget or errors out, it falls back to a plain context-aware answer instead of surfacing a dead end.
 * **The Atelier Meter is opportunistic, not automatic** - only yes/no-shaped questions get one; everything else skips straight to citation rendering.

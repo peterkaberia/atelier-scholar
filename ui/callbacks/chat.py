@@ -1,3 +1,4 @@
+import base64
 import html
 import dash
 import logging
@@ -9,6 +10,7 @@ from database.models import SessionModel
 from llm import AtelierAIEngine
 from pipeline.agent import run_investigation as run_investigation_agent
 from pipeline.nodes import extract_records
+from pipeline.uploads import ingest_uploaded_documents
 from ui.layouts import build_flow_header, build_loading_skeleton, build_paper_cards, build_synthesis_body
 from .background import background_manager
 
@@ -137,23 +139,42 @@ def handle_feed_interactions(session_id, bottom_clicks, pending_search, bottom_t
         if not bottom_clicks or (not has_text and not has_uploads):
             return [no_update] * 7
 
-        # Attachments take a SEPARATE path from the normal SEARCH/CHAT/
-        # INVESTIGATE router entirely - an uploaded document needs to be
-        # ingested (pipeline/uploads.py) unconditionally, regardless of
-        # what route_intent's LLM classifier would have guessed for the
-        # accompanying text, and even when there's no accompanying text at
-        # all (attach-only, no question - see run_upload's docstring for
-        # why that's a valid, distinct case, not force-routed through CHAT).
-        if has_uploads:
-            label = "Processing attached document(s)..." if not has_text else "Reading attachments and analyzing your question..."
-            existing_flows.append(build_loading_skeleton(bottom_text or "Processing attachments...", label, icon="upload_file", spin=False))
+        # Attach-only (no question at all) is a separate, simpler path
+        # straight to run_upload (pipeline/uploads.py) - see its docstring
+        # for why that's a valid, distinct case ("just add this to my
+        # evidence pool"), not force-routed through the classifier below.
+        #
+        # Attach PLUS a real question goes through trigger-router instead,
+        # same as a plain-text-only follow-up - route_intent
+        # (ui/callbacks/chat.py) ingests the attachment itself, before
+        # classifying, so it's already part of the session's evidence pool
+        # regardless of whether the classifier ultimately decides this
+        # follow-up needs a fresh SEARCH, a CHAT answer, or an
+        # INVESTIGATE dig. Previously this ALWAYS went straight to
+        # run_upload regardless of the accompanying text, meaning a
+        # follow-up that attached a new document and asked something
+        # needing genuinely fresh literature could never trigger a real
+        # search - confirmed live as "when attached file it does not move
+        # to search and extract."
+        if has_uploads and not has_text:
+            existing_flows.append(build_loading_skeleton("Processing attachments...", "Processing attached document(s)...", icon="upload_file", spin=False))
             upload_payload = {
-                "query": bottom_text or "", "llm": bottom_llm, "session_id": session_id,
+                "query": "", "llm": bottom_llm, "session_id": session_id,
                 "existing_flows": existing_flows, "files": pending_uploads,
             }
             # Trigger upload, Update flow, Clear bottom input, leave
             # clipboard alone, Clear staged uploads + their chip row
             return no_update, upload_payload, existing_flows, "", no_update, [], []
+
+        if has_uploads:
+            existing_flows.append(build_loading_skeleton(bottom_text, "Analyzing query intent..."))
+            router_payload = {
+                "query": bottom_text, "llm": bottom_llm, "session_id": session_id,
+                "existing_flows": existing_flows, "files": pending_uploads,
+            }
+            # Trigger router, Update flow, Clear bottom input, leave
+            # clipboard alone, Clear staged uploads + their chip row
+            return router_payload, no_update, existing_flows, "", no_update, [], []
 
         # Inject Skeleton Loader
         existing_flows.append(build_loading_skeleton(bottom_text, "Analyzing query intent..."))
@@ -178,9 +199,10 @@ def handle_feed_interactions(session_id, bottom_clicks, pending_search, bottom_t
     State('store-current-topic', 'data'),
     background=True,
     manager=background_manager(),
+    progress=[Output('pending-flow-update', 'data', allow_duplicate=True)],
     prevent_initial_call=True
 )
-def route_intent(router_data, current_topic):
+def route_intent(set_progress, router_data, current_topic):
     """
     Context-Aware Intent Router.
     Determines if the user's query requires fetching new documents (SEARCH)
@@ -233,6 +255,21 @@ def route_intent(router_data, current_topic):
     own DB fallbacks already use - so this router's CHAT-vs-SEARCH
     decision, and whatever context CHAT/INVESTIGATE ultimately receives,
     reflects everything the session actually knows, not just its last turn.
+
+    Any file(s) attached to THIS turn (router_data.get('files')) are
+    ingested right here, unconditionally, BEFORE classification - not
+    just when the classifier happens to land on SEARCH. A follow-up
+    attachment used to always bypass this router entirely and go straight
+    to run_upload/plain-chat (ui/callbacks/uploads.py), meaning a follow-
+    up that attached a new document AND asked something that genuinely
+    needed fresh literature could never trigger a real search - confirmed
+    live as "when attached file it does not move to search and extract."
+    Ingesting here, once, before current_topic/processed_records are even
+    computed, means the newly-uploaded document is already part of the
+    session's evidence pool by the time classification runs, so it's
+    naturally available to WHICHEVER route wins (SEARCH, CHAT, or
+    INVESTIGATE) with no per-route special-casing needed downstream -
+    run_search no longer needs its own separate ingestion step either.
     """
     # Every background=True callback runs in its own spawned subprocess
     # that never imports app.py - see run_search's identical call/comment
@@ -248,11 +285,49 @@ def route_intent(router_data, current_topic):
     if not current_topic:
         current_topic = AtelierRepository.get_session_topic(session_id)
     # Always the full session-wide pool - see this function's own
-    # docstring for why neither the live Store nor a single-turn DB
-    # lookup is enough on its own.
+    # docstring for why neither the live Store nor a single-turn DB lookup
+    # is enough on its own.
     processed_records = [r.__dict__ for r in AtelierRepository.get_session_processed_papers(session_id, limit=100)]
 
-    if not current_topic or not processed_records:
+    # Captured BEFORE ingesting any attached file below - a genuinely
+    # brand-new session (create_new_session, ui/callbacks/search.py) must
+    # still force a real SEARCH even when it was started with an
+    # attachment, not just answer from the just-ingested file because
+    # processed_records is no longer empty by the time this check runs.
+    # See this function's own docstring for the full reasoning.
+    is_first_turn = not current_topic or not processed_records
+
+    files_payload = router_data.get('files') or []
+    if files_payload:
+        def report(label: str):
+            live_flows = existing_flows[:-1] + [build_loading_skeleton(query or "Processing attachments...", label, icon="upload_file", spin=False)]
+            set_progress([{"session_id": session_id, "updates": {"flow_container": live_flows}}])
+
+        decoded_files = []
+        for f in files_payload:
+            filename = f.get("filename") or "file"
+            content = f.get("content") or ""
+            try:
+                _header, b64data = content.split(",", 1)
+                decoded_files.append((filename, base64.b64decode(b64data)))
+            except Exception as e:
+                logger.warning(f"Could not decode uploaded file '{filename}': {e}")
+
+        if decoded_files:
+            ingest_topic = query or current_topic or "this document"
+            _uploaded, failed = ingest_uploaded_documents(
+                session_id=session_id, files=decoded_files, topic=ingest_topic,
+                model_choice=selected_llm, report=report,
+            )
+            if failed:
+                logger.warning(f"Couldn't process attached file(s) for session {session_id}: {', '.join(failed)}")
+            # Refreshed so classification/context below sees what was
+            # just ingested - is_first_turn above already captured
+            # whether there was any PRE-EXISTING context, so this
+            # refresh can't accidentally suppress the forced-SEARCH path.
+            processed_records = [r.__dict__ for r in AtelierRepository.get_session_processed_papers(session_id, limit=100)]
+
+    if is_first_turn:
         route = "SEARCH"
         search_query = query
     else:
@@ -300,16 +375,13 @@ def route_intent(router_data, current_topic):
         # replaces this skeleton with live per-stage progress.
         existing_flows.append(build_loading_skeleton(search_query, "Planning your search..."))
         pending = {"session_id": session_id, "updates": {"flow_container": existing_flows}}
-        # files passes through from router_data untouched (only ever
-        # actually populated when create_new_session dispatched here for
-        # a brand-new session started with an attachment PLUS a real
-        # question - see its docstring) - run_search folds any attached
-        # document(s) into the SAME processed_records the search itself
-        # produces, so a session's first-ever turn combines both instead
-        # of a real search never happening at all.
+        # No files key here - any attachment on THIS turn was already
+        # ingested above, before classification ran, so it's already part
+        # of processed_records/the session's evidence pool by now. run_search
+        # doesn't need its own separate ingestion step.
         search_trigger = {
             "query": search_query, "llm": selected_llm, "session_id": session_id,
-            "existing_flows": existing_flows, "files": router_data.get('files'),
+            "existing_flows": existing_flows,
         }
         return search_trigger, no_update, no_update, pending
 
@@ -458,7 +530,7 @@ def run_chat(chat_data, chat_history):
         # (results-accordion-body), so repeating it per turn no longer
         # means repeating it VISIBLY per turn either.
         new_flow = html.Div(className="flow-block border-t border-slate-100", children=[
-            build_flow_header(query, selected_llm, f"{len(processed_records)} Context Papers", query_id=new_query_id),
+            build_flow_header(query, selected_llm, f"{len(processed_records)} Context Papers", query_id=new_query_id, synthesis_text=ai_response),
             build_synthesis_body(ai_response, valid_records=processed_records),
             build_paper_cards(processed_records, query_id=new_query_id, session_id=session_id),
         ])
@@ -627,7 +699,7 @@ def run_investigation(set_progress, investigate_data, chat_history):
         # reconstruction (layout_feed) already rendered this on reload;
         # this was the gap that made it look reload-only live.
         new_flow = html.Div(className="flow-block border-t border-slate-100", children=[
-            build_flow_header(query, selected_llm, ref_label, query_id=new_query_id),
+            build_flow_header(query, selected_llm, ref_label, query_id=new_query_id, synthesis_text=answer_text),
             build_synthesis_body(answer_text, title="Investigation", valid_records=valid_records),
             build_paper_cards(valid_records, query_id=new_query_id, session_id=session_id),
         ])

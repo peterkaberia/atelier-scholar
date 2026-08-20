@@ -12,6 +12,7 @@ import logging
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
+import diskcache
 import requests
 
 logger = logging.getLogger(__name__)
@@ -264,18 +265,43 @@ def list_provider_models(provider: str, credential: str) -> List[str]:
 # the id-only fetchers, since the two caches can independently expire and
 # there's no clean way to recover a discarded number from a cached List[str].
 
-_CONTEXT_CACHE: Dict[str, Tuple[float, Dict[str, int]]] = {}
+# Disk-backed (not a plain in-memory dict, unlike _CACHE above) because
+# get_model_context_length is called from budget functions used INSIDE the
+# pipeline (pipeline/nodes.py, agent.py, agent_tools.py) - code that only
+# ever runs inside a Dash background=True callback. Every one of those
+# callbacks executes in its own freshly-spawned OS process (see
+# ui/callbacks/background.py's DiskcacheManager - the child never imports
+# app.py or inherits any previous process's globals, the same fact that
+# separately required setup_global_logging() to be called explicitly in
+# every background callback). A plain module-level dict here reset to
+# empty on literally every search/chat/upload turn, meaning EVERY turn
+# silently paid a fresh ~1-8s live network round-trip to OpenRouter/
+# Google's models endpoint before any real pipeline work even started -
+# confirmed live, reported directly as "significant slowdown... preparing
+# session taking a lot of time." (The UI's progress label lags one node
+# behind whatever's actually running - orchestrator.py's
+# _NODE_PROGRESS_LABELS only updates once a node COMPLETES - so this
+# looked like ensure_session itself was slow, when the real time was
+# being spent inside plan_queries_node, the first node downstream that
+# touches a budget function.) diskcache's SQLite-backed store is safe for
+# concurrent multi-process reads/writes, so this now genuinely survives
+# across every background job instead of resetting each time. Uses
+# wall-clock time.time() rather than time.monotonic() specifically because
+# the cached timestamp gets compared by a DIFFERENT process than the one
+# that wrote it - monotonic()'s reference point isn't guaranteed
+# comparable across processes, only time.time()'s is.
+_context_disk_cache = diskcache.Cache("./cache/model_catalog")
 
 
 def _cached_context_lengths(cache_key: str, fetch_fn: Callable[[], Dict[str, int]]) -> Dict[str, int]:
-    now = time.monotonic()
-    cached = _CONTEXT_CACHE.get(cache_key)
+    now = time.time()
+    cached = _context_disk_cache.get(cache_key)  # (cached_at, lengths) or None
     if cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
         return cached[1]
 
     try:
         lengths = fetch_fn()
-        _CONTEXT_CACHE[cache_key] = (now, lengths)
+        _context_disk_cache.set(cache_key, (now, lengths))
         return lengths
     except Exception as e:
         logger.warning(f"Context-length listing failed for '{cache_key}': {e}")

@@ -216,7 +216,7 @@ def poll_session_status(n_intervals, session_id):
     if chat_history:
         flows = [
             html.Div(className="flow-block border-t border-slate-100", children=[
-                build_flow_header(chat.get('prompt'), chat.get('model_used'), f"{len(chat.get('citations', []))} References"),
+                build_flow_header(chat.get('prompt'), chat.get('model_used'), f"{len(chat.get('citations', []))} References", synthesis_text=chat.get('synthesis')),
                 build_synthesis_body(chat.get('synthesis'), valid_records=chat.get('citations', [])),
                 build_paper_cards(chat.get('citations', [])),
             ])

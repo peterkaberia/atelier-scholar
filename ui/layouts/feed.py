@@ -2,6 +2,7 @@ import json
 import re
 from typing import Dict
 from dash import html, dcc
+from core.pdf_export import derive_document_title, strip_leading_title
 from core.utils import classify_study_type
 from database.repository import AtelierRepository
 from database.models import SessionModel
@@ -54,7 +55,7 @@ def layout_feed(session_id: str, pending_search: dict = None):
 
         for chat in chat_history:
             historical_flows.append(html.Div(className="flow-block border-t border-slate-100", children=[
-                build_flow_header(chat.get('prompt'), chat.get('model_used'), f"{len(chat.get('citations', []))} References", query_id=chat.get('query_id')),
+                build_flow_header(chat.get('prompt'), chat.get('model_used'), f"{len(chat.get('citations', []))} References", query_id=chat.get('query_id'), synthesis_text=chat.get('synthesis')),
                 build_atelier_meter(chat.get('consensus_meter')),
                 build_synthesis_body(chat.get('synthesis'), valid_records=chat.get('citations', [])),
                 build_paper_cards(chat.get('citations', []), query_id=chat.get('query_id'), session_id=session_id)
@@ -250,7 +251,7 @@ def build_failed_placeholder(topic: str = "", session_id: str = ""):
     ])
 
 
-def build_flow_header(query: str, model_name: str, ref_text: str, query_id=None):
+def build_flow_header(query: str, model_name: str, ref_text: str, query_id=None, synthesis_text: str = ""):
     """
     query_id (optional): when given, wraps the reference-count span in a
     pattern-matching id so ui/callbacks/library.py's load_more callback can
@@ -260,7 +261,28 @@ def build_flow_header(query: str, model_name: str, ref_text: str, query_id=None)
     saved QueryModel row to work from, so both are simply absent if a save
     ever failed and no id came back (rare, but see save_query_with_citations's
     docstring - None is a real possible return).
+
+    synthesis_text (optional): the turn's own answer, used the exact same
+    way core.pdf_export.derive_document_title uses it for the PDF export -
+    a long "write me a report" prompt (often several pasted paragraphs of
+    background plus the actual ask) used to get rendered VERBATIM as this
+    header's H1, confirmed live via screenshot: multiple screen-heights of
+    bolded prompt text before any actual content. Preferring the answer's
+    own opening heading when it has one (chat_with_literature's
+    structured-deliverable mode writes one) gives a real, readable title
+    instead - falls back to a short truncated query for genres with no
+    heading (a plain Q&A answer), so nothing changes for the common case.
+    Whenever the displayed title differs from the raw query (i.e. it came
+    from the report's own heading, not the query itself), the original
+    query is kept visible right below it in a small "Original request" box
+    - not just a hover tooltip - so it stays genuinely readable on the page
+    itself, matching core.pdf_export.build_turn_pdf's identical box in the
+    PDF export (reported directly: the prompt needed to stay visible on
+    the web page, not just the PDF).
     """
+    display_title = derive_document_title(synthesis_text, query)
+    query = query or ""
+    show_original_prompt = display_title.strip() != query.strip()
     ref_span = html.Span(ref_text, className="text-[11px] font-extrabold text-slate-500 uppercase tracking-widest")
     pdf_button = None
     if query_id is not None:
@@ -272,10 +294,18 @@ def build_flow_header(query: str, model_name: str, ref_text: str, query_id=None)
             className="flex items-center space-x-2 text-[11px] font-extrabold text-slate-400 hover:text-primary uppercase tracking-widest transition-colors",
         )
 
+    prompt_box = None
+    if show_original_prompt:
+        prompt_box = html.Div(className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3", children=[
+            html.Span("Original request", className="block text-[9px] font-extrabold text-primary uppercase tracking-widest mb-1"),
+            html.P(query, className="text-xs text-slate-500 leading-relaxed whitespace-pre-wrap m-0"),
+        ])
+
     return html.Section(className="py-12 px-4 md:px-12", children=[
         html.Div(className="max-w-3xl mx-auto", children=[
             html.Div(className="flex flex-col space-y-3 max-w-3xl", children=[
-                html.H1(query, className="text-3xl font-extrabold text-slate-900 tracking-tight"),
+                html.H1(display_title, title=query, className="text-3xl font-extrabold text-slate-900 tracking-tight"),
+                prompt_box,
                 html.Div(className="flex items-center space-x-6", children=[
                     html.Div(className="flex items-center space-x-2", children=[
                         html.Span("precision_manufacturing", className="material-symbols-outlined text-primary text-lg"),
@@ -358,6 +388,14 @@ def build_atelier_meter(meter_data: dict):
 
 def build_synthesis_body(raw_markdown: str, title: str = "Synthesis Summary", valid_records: list = None):
     """
+    Strips the answer's own leading heading (via strip_leading_title)
+    before rendering - build_flow_header, right above this in the page,
+    already displays that exact same heading as the page's H1 title (see
+    its own docstring), so rendering it again here as the body's first
+    line duplicated it - confirmed live via screenshot: the report's title
+    appearing twice in a row. Safe for every other genre too (a plain Q&A
+    answer has no leading heading to strip, so this is a no-op there).
+
     No separate references section: the Evidence Library (build_paper_cards,
     further down the page) already lists every cited paper in full, so a
     second list here would just duplicate it. Instead, the [N] markers
@@ -382,7 +420,8 @@ def build_synthesis_body(raw_markdown: str, title: str = "Synthesis Summary", va
     if valid_records is None:
         valid_records = []
 
-    escaped_markdown = re.sub(r'\[(\d+)\]', r'\\[\1\\]', raw_markdown or "")
+    body_markdown = strip_leading_title(raw_markdown or "")
+    escaped_markdown = re.sub(r'\[(\d+)\]', r'\\[\1\\]', body_markdown)
 
     citations_payload = json.dumps([
         {

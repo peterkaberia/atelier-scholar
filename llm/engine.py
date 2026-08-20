@@ -783,6 +783,7 @@ class AtelierAIEngine:
 
         In ALL modes: you MUST cite claims grounded in the Context using the bracketed numbers from the context headers (e.g., [1]).
         CRITICAL: If citing multiple papers, use separate brackets like [1][2]. DO NOT use comma-separated formats like [1, 2].
+        Do NOT write your own "References" or "Bibliography" section, even for a long report - Atelier automatically builds a complete, correctly-numbered reference list from every [n] you cite in the prose. A second, self-written one is redundant at best and produces a confusing duplicate reference list in exports at worst. End your answer once the prose itself is done.
 
         Context:
         {context_str}
