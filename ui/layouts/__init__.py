@@ -9,7 +9,6 @@ from .feed import (
     build_synthesis_body,
     layout_feed,
 )
-from .history import build_history_list, build_status_dot, layout_history
 from .home import layout_home
 from .main import index_string, layout_404, layout_no_llm, serve_layout
 from .settings import layout_settings

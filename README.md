@@ -145,6 +145,9 @@ flowchart TD
     AgentOK -->|Yes| Cite
     AgentOK -->|"No / error - fall back"| Chat
 
+    Agent -.->|"search_more_papers tool:<br/>re-runs this SAME pipeline<br/>for a follow-up query"| Search
+    EnoughRelevant -.->|"when triggered by the agent,<br/>results return directly to its<br/>tool loop - NOT through<br/>Merge/Synthesize below"| Agent
+
     Chat["Answer from the session's<br/>existing evidence"] --> Cite
 
     Synthesize["Genre-adaptive answer:<br/>question, rewrite, or deliverable"] --> YesNo{"Yes/no research<br/>question?"}
@@ -162,6 +165,7 @@ A few of the less obvious decision points:
 * **Attach-only (no question at all) is the one genuine exception** - with nothing to route or search for, it goes straight to ingestion and a confirmation, whether this is a brand-new session or a follow-up.
 * **`route_intent`'s "needs new evidence" guess isn't final** - before committing to a full external search, it checks whether papers the original search already found but ranked too low to extract happen to cover the follow-up, and reclassifies as CHAT/INVESTIGATE if so. Much cheaper than a fresh multi-engine search, and only spent when the cheap classification already leans that way.
 * **The investigation agent isn't the only INVESTIGATE outcome** - if it hits its tool-call budget or errors out, it falls back to a plain context-aware answer instead of surfacing a dead end.
+* **The agent can trigger the full Search & Extraction Pipeline too** - its `search_more_papers` tool re-runs the exact same pipeline shown above for a follow-up query it decides it needs, not a separate simplified search. The dashed lines mark this: it's a nested call the agent makes mid-reasoning, so the results return straight back into its own tool loop rather than continuing on to `Merge`/`Synthesize` - those two are specific to the top-level SEARCH route, not something an agent-triggered search passes through.
 * **The Atelier Meter is opportunistic, not automatic** - only yes/no-shaped questions get one; everything else skips straight to citation rendering.
 
 ## 🏗️ Architecture Overview

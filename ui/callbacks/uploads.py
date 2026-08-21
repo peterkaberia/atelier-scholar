@@ -233,9 +233,9 @@ def run_upload(set_progress, upload_data, chat_history):
                 session_id=session_id, prompt=query, synthesis=ai_response,
                 model_used=selected_llm, cited_records=cited_records,
             )
-            new_flow = html.Div(className="flow-block border-t border-slate-100", children=[
+            new_flow = html.Div(id=f"turn-{new_query_id}", className="flow-block border-t border-slate-100", children=[
                 build_flow_header(query, selected_llm, f"{len(cited_records)} Context Papers", query_id=new_query_id, synthesis_text=ai_response),
-                build_synthesis_body(ai_response, valid_records=cited_records),
+                build_synthesis_body(ai_response, valid_records=cited_records, query_id=new_query_id),
                 build_paper_cards(cited_records, query_id=new_query_id, session_id=session_id),
             ])
         else:
@@ -253,9 +253,9 @@ def run_upload(set_progress, upload_data, chat_history):
                 session_id=session_id, prompt=title, synthesis=summary_md,
                 model_used=selected_llm, cited_records=processed,
             )
-            new_flow = html.Div(className="flow-block border-t border-slate-100", children=[
+            new_flow = html.Div(id=f"turn-{new_query_id}", className="flow-block border-t border-slate-100", children=[
                 build_flow_header(title, selected_llm, f"{len(processed)} New Papers", query_id=new_query_id, synthesis_text=summary_md),
-                build_synthesis_body(summary_md, title="Documents Added", valid_records=processed),
+                build_synthesis_body(summary_md, title="Documents Added", valid_records=processed, query_id=new_query_id),
                 build_paper_cards(processed, query_id=new_query_id, session_id=session_id),
             ])
 

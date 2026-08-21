@@ -1,7 +1,7 @@
 from dash import Input, Output, State, callback
 from database import AtelierRepository
 from llm import get_model_choices
-from ui.layouts import layout_home, layout_history, layout_feed, layout_404, layout_no_llm, layout_settings
+from ui.layouts import layout_home, layout_feed, layout_404, layout_no_llm, layout_settings
 
 @callback(
     Output('page-content', 'children'),
@@ -24,11 +24,11 @@ def display_page(pathname, pending_search):
 
     if pathname is None or pathname == '/':
         return layout_home()
-    
-    elif pathname == '/history': 
-        return layout_history()
-    
-    elif pathname and pathname.startswith('/history/'):
+
+    # No standalone '/history' archive page anymore - the sidebar's own
+    # date-grouped, searchable session list (ui/layouts/sidebar.py) already
+    # covers that job, always visible rather than a separate page to visit.
+    elif pathname and pathname.startswith('/session/'):
         session_id = pathname.split('/')[-1] 
 
         if session_id and session_id.strip():

@@ -69,6 +69,7 @@ class AtelierRepository:
         # the rare concurrent-process race is caught and ignored below.
         AtelierRepository._ensure_column("queries", "consensus_meter", "TEXT")
         AtelierRepository._ensure_column("query_citations", "citation_index", "INTEGER")
+        AtelierRepository._ensure_column("sessions", "model_used", "TEXT")
 
         logger.info("Local SQLite database initialized successfully.")
 
@@ -141,7 +142,7 @@ class AtelierRepository:
             return db.get(SessionModel, session_id) is not None
 
     @staticmethod
-    def create_session(session_id: str, topic: str, summary: str = "") -> None:
+    def create_session(session_id: str, topic: str, summary: str = "", model_used: str = "") -> None:
         """
         Creates a new search session to track user history and linked papers.
         Starts in STATUS_IN_PROGRESS - see set_session_status().
@@ -150,9 +151,13 @@ class AtelierRepository:
             session_id (str): The unique ID of the session.
             topic (str): The overarching research question.
             summary (str): An optional summary of the session findings.
+            model_used (str): Whichever model was selected on Home when this
+                session was created - see SessionModel.model_used's own
+                docstring for why this exists separately from
+                QueryModel.model_used.
         """
         with get_db_session() as db:
-            db.add(SessionModel(id=session_id, topic=topic, summary=summary))
+            db.add(SessionModel(id=session_id, topic=topic, summary=summary, model_used=model_used or None))
         logger.info(f"Created new database session: {session_id}")
 
     @staticmethod
@@ -213,10 +218,17 @@ class AtelierRepository:
     def get_last_used_model(session_id: str) -> str:
         """
         Returns the model_used from this session's most recent completed
-        turn, or "" if the session has no turns yet (e.g. still on its
-        first search). Used to default the feed page's model dropdown to
-        whatever the user was actually using last, instead of always
-        resetting to the first entry in the provider list.
+        turn, falling back to SessionModel.model_used (the model selected
+        when the session was FIRST created, before any turn has actually
+        finished) when there's no completed turn yet, and finally "" if
+        neither exists. Used to default the feed page's model dropdown to
+        whatever the user was actually using, instead of always resetting
+        to the first entry in the provider list - and now also to show a
+        real model name on the "still processing" placeholder for a
+        session's very first turn, which previously had nothing to show at
+        all (get_all_sessions_for_history's own dict doesn't carry this,
+        so build_processing_placeholder's caller reaches for this
+        specifically).
         """
         with get_db_session() as db:
             last_query = db.execute(
@@ -225,7 +237,10 @@ class AtelierRepository:
                 .order_by(QueryModel.created_at.desc())
                 .limit(1)
             ).scalar_one_or_none()
-            return last_query or ""
+            if last_query:
+                return last_query
+            session = db.get(SessionModel, session_id)
+            return (session.model_used if session else "") or ""
 
     @staticmethod
     def get_last_query_id(session_id: str) -> Optional[int]:

@@ -1,7 +1,7 @@
 import logging
 
 from functools import lru_cache
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -13,6 +13,7 @@ except ImportError:
 from core.config import STUDY_TYPE_WEIGHTS
 from core.utils import normalize_space, citation_bonus, year_bonus, classify_study_type
 from database.models import Record
+from search.sparse_server import call_warm_encoder
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,41 @@ def get_sparse_encoder(model_name: str):
         
     logger.info(f"Loading SparseEncoder '{model_name}' into memory for the first time...")
     return SparseEncoder(model_name)
+
+# ==========================================
+# LOW-LEVEL ENCODE PRIMITIVES
+# ==========================================
+#
+# Pulled out from compute_scores/encode_chunks/encode_query_sparse below so
+# search/sparse_server.py's warm-process dispatch can call the exact same
+# logic against an already-loaded model, instead of a second copy that could
+# drift from what the local (cold-load) path actually does. Each function
+# takes an already-loaded `model` - neither the local callers below nor the
+# server's dispatch pay for a fresh get_sparse_encoder() call here, they
+# fetch/reuse it themselves first.
+
+def _encode_query_dict(model, text: str) -> Dict[str, float]:
+    query_vector = model.encode_query([text])
+    return dict(model.decode(query_vector, top_k=None)[0])
+
+
+def _encode_documents(model, texts: List[str], top_k: int) -> List[Dict[str, float]]:
+    if not texts:
+        return []
+    doc_vectors = model.encode_document(texts)
+    decoded = model.decode(doc_vectors, top_k=top_k)
+    return [dict(pairs) for pairs in decoded]
+
+
+def _encode_documents_with_similarity(
+    model, query: str, texts: List[str], top_k: int
+) -> Tuple[List[Dict[str, float]], List[float]]:
+    query_vector = model.encode_query([query])
+    doc_vectors = model.encode_document(texts)
+    decoded = model.decode(doc_vectors, top_k=top_k)
+    similarities = model.similarity(query_vector, doc_vectors)[0].tolist()
+    return [dict(pairs) for pairs in decoded], similarities
+
 
 # ==========================================
 # SCORING LOGIC
@@ -99,13 +135,17 @@ def compute_scores(records: List[Record], topic: str, model_name: str) -> None:
     for a fresh model.encode_document() call - on a search that overlaps a
     lot with previous ones, this can skip embedding most of the candidate
     pool instead of re-running the model on every paper every time.
+
+    Tries search/sparse_server.py's warm encoder process first for both the
+    query and any to-embed documents - only falls back to loading the model
+    in THIS process (get_sparse_encoder's genuine ~20s cold load, see that
+    module's docstring) when the warm server isn't reachable.
     """
     try:
-        # 1. Fetch the cached model (Instantaneous after first load!)
-        model = get_sparse_encoder(model_name)
-
-        query_vector = model.encode_query([topic])
-        query_dict = dict(model.decode(query_vector, top_k=None)[0])
+        query_dict = call_warm_encoder("encode_query_dict", model_name, {"text": topic})
+        if query_dict is None:
+            model = get_sparse_encoder(model_name)
+            query_dict = _encode_query_dict(model, topic)
 
         to_embed = [r for r in records if not r.sparse_vector]
         cached = [r for r in records if r.sparse_vector]
@@ -121,12 +161,18 @@ def compute_scores(records: List[Record], topic: str, model_name: str) -> None:
 
         if to_embed:
             docs = [normalize_space(f"{r.title}\n{r.abstract}") for r in to_embed]
-            doc_vectors = model.encode_document(docs)
-            decoded = model.decode(doc_vectors, top_k=128)
-            similarities = model.similarity(query_vector, doc_vectors)[0].tolist()
+            warm_result = call_warm_encoder(
+                "encode_documents_with_similarity", model_name,
+                {"query": topic, "texts": docs, "top_k": 128},
+            )
+            if warm_result is not None:
+                decoded, similarities = warm_result["vectors"], warm_result["similarities"]
+            else:
+                model = get_sparse_encoder(model_name)
+                decoded, similarities = _encode_documents_with_similarity(model, topic, docs, top_k=128)
 
             for idx, rec in enumerate(to_embed):
-                rec.sparse_vector = dict(decoded[idx])
+                rec.sparse_vector = decoded[idx]
                 rec.sparse_score = round(float(similarities[idx]), 6)
 
         if cached:
@@ -168,13 +214,16 @@ def encode_chunks(chunks: List[str], model_name: str, top_k: int = 128) -> List[
     Encodes text passages into SPLADE sparse dicts (e.g. {"cell": 1.2}) ready
     for JSON storage on PaperChunk. Capped to the top_k highest-weighted
     tokens per chunk to keep stored vectors small.
+
+    Tries the warm encoder server first - see compute_scores's docstring.
     """
     if not chunks:
         return []
+    result = call_warm_encoder("encode_documents", model_name, {"texts": chunks, "top_k": top_k})
+    if result is not None:
+        return result
     model = get_sparse_encoder(model_name)
-    doc_vectors = model.encode_document(chunks)  # 2D tensor: (len(chunks), vocab_size)
-    decoded = model.decode(doc_vectors, top_k=top_k)  # list[list[(token, weight)]], one per chunk
-    return [dict(pairs) for pairs in decoded]
+    return _encode_documents(model, chunks, top_k)
 
 
 @lru_cache(maxsize=256)
@@ -187,8 +236,13 @@ def encode_query_sparse(query: str, model_name: str) -> Dict[str, float]:
     each time. Safe to cache despite returning a dict: every caller
     (compute_scores, sparse_batch_dot, get_top_chunks_for_paper,
     search_papers_by_vector) only reads it, never mutates it in place.
+
+    Tries the warm encoder server first - see compute_scores's docstring.
+    The lru_cache above still short-circuits a repeated query within ONE
+    process before it even reaches that call, warm server or not.
     """
+    result = call_warm_encoder("encode_query_dict", model_name, {"text": query})
+    if result is not None:
+        return result
     model = get_sparse_encoder(model_name)
-    query_vector = model.encode_query([query])  # 2D tensor: (1, vocab_size)
-    decoded = model.decode(query_vector, top_k=None)  # list[list[(token, weight)]], one entry
-    return dict(decoded[0])
+    return _encode_query_dict(model, query)

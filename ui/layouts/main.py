@@ -134,6 +134,65 @@ index_string = '''
                             backdrop.classList.add('hidden');
                         }
                         return window.dash_clientside.no_update;
+                    },
+                    // Shown on every page except Home - Settings included,
+                    // now: it used to only show on a session detail view
+                    // (/session/<id>), which left Settings as a genuine
+                    // dead end - no way back to wherever you came from
+                    // short of the browser's own back button, reported
+                    // directly ("getting stuck with no back option").
+                    // Home itself is the one true root with nowhere
+                    // further back to go within the app.
+                    toggleAppBarBackButton: function(pathname) {
+                        var isHome = !pathname || pathname === '/';
+                        return {display: isHome ? 'none' : 'flex'};
+                    },
+                    // The Settings icon's own job is "go to Settings" -
+                    // pointless (and previously just sat there doing
+                    // nothing useful) while already ON Settings, reported
+                    // directly ("it should also not have setting button").
+                    // The back button above already covers leaving the
+                    // page from here.
+                    toggleAppBarSettingsIcon: function(pathname) {
+                        var onSettings = pathname === '/settings';
+                        return {display: onSettings ? 'none' : 'flex'};
+                    },
+                    // Inverse of the above - the sidebar's global "search
+                    // all sessions" box hides while viewing one session's
+                    // own detail page, alongside the history list it
+                    // filters (ui/callbacks/ui_extras.py's
+                    // update_sidebar_history already returns nothing there
+                    // server-side) - "other sessions" shouldn't appear on
+                    // a session's own page at all, reported directly.
+                    toggleSidebarSearchBox: function(pathname) {
+                        var isSessionView = !!(pathname && pathname.indexOf('/session/') === 0);
+                        return {display: isSessionView ? 'none' : 'block'};
+                    },
+                    // Real browser back (not a hardcoded "go to Home" link) -
+                    // returns wherever the user actually came from, whether
+                    // that was Home, a different session, or an external
+                    // referrer. Client-side only: Dash's own dcc.Location
+                    // never needs to know this happened, so there's no
+                    // server round trip for a plain navigation.
+                    goBack: function(n_clicks) {
+                        if (n_clicks) { window.history.back(); }
+                        return window.dash_clientside.no_update;
+                    },
+                    // Mobile's own back button - same rule as
+                    // toggleAppBarBackButton (hidden on Home, shown
+                    // everywhere else), separate function/Output since
+                    // it's a different button id than the desktop app
+                    // bar's.
+                    toggleMobileBackButton: function(pathname) {
+                        var isHome = !pathname || pathname === '/';
+                        return {display: isHome ? 'none' : 'flex'};
+                    },
+                    // Same real-browser-back as goBack, wired to the
+                    // mobile button separately for the same reason as
+                    // toggleMobileBackButton above.
+                    mobileGoBack: function(n_clicks) {
+                        if (n_clicks) { window.history.back(); }
+                        return window.dash_clientside.no_update;
                     }
                 }
             });
@@ -211,6 +270,31 @@ index_string = '''
                 });
 
                 container.dataset.citationsEnriched = 'true';
+            }
+
+            // Assigns stable, POSITION-based ids to each turn's own H2
+            // section headings ("turn-{queryId}-h-{i}") so the sidebar's
+            // per-session table of contents (ui/callbacks/ui_extras.py's
+            // _build_session_nav_items) can link straight to one via a
+            // plain #fragment. dcc.Markdown doesn't emit heading ids
+            // itself (confirmed directly - a rendered <h2> has no id at
+            // all), so this has to happen here rather than being free.
+            // Index-based rather than a text slug deliberately - the
+            // Python side (core/pdf_export.py's extract_section_headings)
+            // just walks "##" lines in the same top-to-bottom source
+            // order, so both sides agree without needing to match on
+            // heading text itself (which would break on duplicate
+            // headings or unicode slugification edge cases).
+            function assignHeadingIds(container) {
+                if (container.dataset.headingsAssigned) return;
+                if (!container.textContent || !container.textContent.trim()) return;
+                var queryId = container.dataset.queryId;
+                if (!queryId) { container.dataset.headingsAssigned = 'true'; return; }
+
+                container.querySelectorAll('h2').forEach(function (h, i) {
+                    h.id = 'turn-' + queryId + '-h-' + i;
+                });
+                container.dataset.headingsAssigned = 'true';
             }
 
             // Keeps only the LATEST turn's Results/Evidence-Library section
@@ -337,9 +421,11 @@ index_string = '''
             // Dash has already rendered synthesis content by then.
             function initCitationWatcher() {
                 document.querySelectorAll('.synthesis-citations:not([data-citations-enriched])').forEach(enrichSynthesisCitations);
+                document.querySelectorAll('.synthesis-citations:not([data-headings-assigned])').forEach(assignHeadingIds);
                 enforceActiveFlowBlock();
                 var citationObserver = new MutationObserver(function (mutationsList) {
                     document.querySelectorAll('.synthesis-citations:not([data-citations-enriched])').forEach(enrichSynthesisCitations);
+                    document.querySelectorAll('.synthesis-citations:not([data-headings-assigned])').forEach(assignHeadingIds);
                     if (touchesFlowContainer(mutationsList)) enforceActiveFlowBlock();
                 });
                 citationObserver.observe(document.body, { childList: true, subtree: true });
@@ -514,6 +600,29 @@ index_string = '''
                 }
             });
 
+            // Sidebar's per-session table of contents (ui/callbacks/
+            // ui_extras.py's _build_session_nav_items) links to a turn/
+            // section via a plain "#turn-..." href - a REAL anchor tag,
+            // native browser fragment navigation. That's exactly the
+            // problem: clicking one pushes a new browser-history entry for
+            // the fragment, so the app bar's Back button (see goBack
+            // above) had to be clicked once per section jump just to
+            // shed each fragment entry before it could ever reach the
+            // actual PREVIOUS PAGE - reported directly ("back should only
+            // take back to the previous page not previous section").
+            // Intercepting the click, scrolling manually, and never
+            // touching location.hash at all means no history entry is
+            // EVER created for these jumps - a real page navigation stays
+            // exactly one Back click away, regardless of how many
+            // sections were visited first.
+            document.addEventListener('click', function (e) {
+                var link = e.target.closest('a[href^="#turn-"]');
+                if (!link) return;
+                e.preventDefault();
+                var target = document.getElementById(link.getAttribute('href').slice(1));
+                if (target) target.scrollIntoView({behavior: 'smooth', block: 'start'});
+            });
+
             // Enter submits, Shift+Enter inserts a newline - standard
             // chat-app convention (Slack/Discord/ChatGPT). Both
             // search-input (ui/layouts/feed.py's follow-up bar) and
@@ -685,7 +794,7 @@ def serve_layout():
         # Deliberately memory, NOT storage_type='session' like
         # store-pending-search right above - this used to be 'session' so a
         # file attached on the HOME page would survive the client-side
-        # route change to /history/<id>, but that meant the browser's
+        # route change to /session/<id>, but that meant the browser's
         # sessionStorage had to hold the raw base64-encoded file content -
         # confirmed live: sessionStorage's hard ~5-10MB per-origin quota
         # (browser-imposed, not something Atelier can raise) means any
@@ -729,6 +838,11 @@ def serve_layout():
         dcc.Store(id='mobile-menu-toggle-dummy', data=0),
         dcc.Store(id='mobile-menu-nav-dummy', data=0),
 
+        # APP BAR BACK BUTTON (see goBack in app.py) - clientside callbacks
+        # need SOME Output; this one is never actually read.
+        dcc.Store(id='app-bar-back-dummy', data=0),
+        dcc.Store(id='mobile-back-dummy', data=0),
+
         # MOBILE TOP BAR - the sidebar's replacement when it's off-screen (<md)
         layout_mobile_topbar(),
 
@@ -738,8 +852,49 @@ def serve_layout():
         # SIDEBAR (static column on desktop, slide-in drawer on mobile)
         layout_sidebar(),
 
-        # MAIN ROUTING CANVAS
-        html.Main(id="page-content", className="flex-1 flex flex-col relative h-full bg-[#FDFDFD] overflow-hidden"),
+        # MAIN COLUMN: a persistent desktop app bar sitting above the
+        # actual routed page, both inside this flex-column wrapper so the
+        # app bar's own height is reserved space, not something page
+        # content can scroll underneath. Previously the Settings icon was
+        # just `fixed` with nothing behind it, so a page's own scrolling
+        # content visually ran straight up into the same corner it sat in
+        # - reported directly. This wrapper is what page-content's own
+        # `flex-1` used to apply directly to the <Main> tag; now it applies
+        # to this outer column instead, and page-content just fills
+        # whatever's left below the app bar.
+        html.Div(className="flex-1 flex flex-col h-full min-w-0 overflow-hidden", children=[
+            # Desktop-only (md:flex) - mobile already has its own sticky
+            # topbar (layout_mobile_topbar) playing this exact role, logo
+            # and hamburger included; duplicating it here would be a
+            # second bar stacked on the first.
+            # justify-end (not justify-between) deliberately - the back
+            # button is `position: absolute` on the left, entirely OUT of
+            # normal flex flow, so hiding it (display:none when not on a
+            # session page) can never affect where Settings sits. It
+            # previously used justify-between with two flex children, one
+            # of them display:none - with only ONE item left actually
+            # participating in the flex layout, "space-between" has
+            # nothing to space, so Settings collapsed to the LEFT edge
+            # instead of staying pinned right - confirmed live via
+            # screenshot on Home, where the back button is hidden.
+            html.Div(className="hidden md:flex items-center justify-end relative px-6 h-14 border-b border-border-light bg-surface-light/80 backdrop-blur-sm flex-shrink-0", children=[
+                # Real browser back, not a hardcoded link - only shown on a
+                # session detail view (/session/<id>); see toggleAppBarBackButton
+                # /goBack above. Starts hidden (display:none inline) so
+                # there's no flash of a back button before the pathname
+                # callback has had a chance to run on first load.
+                html.Button(id="app-bar-back-btn", style={"display": "none"}, className="absolute left-6 items-center gap-1.5 text-slate-500 hover:text-primary transition-colors", children=[
+                    html.Span("arrow_back", className="material-symbols-outlined text-xl"),
+                    html.Span("Back", className="text-sm font-semibold"),
+                ]),
+                dcc.Link(id="app-bar-settings-link", href="/settings", className="flex items-center justify-center w-9 h-9 rounded-full text-slate-400 hover:text-primary hover:bg-slate-100 transition-colors", title="Settings", children=[
+                    html.Span("settings", className="material-symbols-outlined text-xl"),
+                ]),
+            ]),
+
+            # MAIN ROUTING CANVAS
+            html.Main(id="page-content", className="flex-1 min-h-0 flex flex-col relative bg-[#FDFDFD] overflow-hidden"),
+        ]),
 
         # PDF VIEWER MODAL - opened/closed entirely client-side (JS click
         # delegation in this file's index_string, see .pdf-viewer-btn):

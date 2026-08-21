@@ -4,10 +4,12 @@ Atelier Main Application Module.
 This file serves as the entry point for the Dash Single Page Application (SPA).
 It handles:
 1. UI Layouts & Tailwind CSS Injection.
-2. Dynamic Routing (/home vs /history vs /history/<id>).
+2. Dynamic Routing (/home vs /history vs /session/<id>).
 3. The AI "Flow" Pipeline (Routing Intent -> Search/Extract -> Synthesize).
 4. State management across sessions using local/session storage.
 """
+
+import os
 
 import dash
 from dash import Input, Output, clientside_callback, ClientsideFunction
@@ -62,6 +64,50 @@ clientside_callback(
     prevent_initial_call=True,
 )
 
+# App bar back button: shown on every page except Home (Settings included -
+# it used to only cover session detail views, which left Settings a dead
+# end), and does a real browser-history back on click - see
+# ui/layouts/main.py's toggleAppBarBackButton/goBack for why each is its
+# own separate clientside callback (one keyed on the URL, one on the
+# click - genuinely different triggers, not the same event).
+clientside_callback(
+    ClientsideFunction(namespace='ui', function_name='toggleAppBarBackButton'),
+    Output('app-bar-back-btn', 'style'),
+    Input('url', 'pathname'),
+)
+clientside_callback(
+    ClientsideFunction(namespace='ui', function_name='toggleAppBarSettingsIcon'),
+    Output('app-bar-settings-link', 'style'),
+    Input('url', 'pathname'),
+)
+clientside_callback(
+    ClientsideFunction(namespace='ui', function_name='toggleSidebarSearchBox'),
+    Output('sidebar-search-box', 'style'),
+    Input('url', 'pathname'),
+)
+clientside_callback(
+    ClientsideFunction(namespace='ui', function_name='goBack'),
+    Output('app-bar-back-dummy', 'data'),
+    Input('app-bar-back-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+
+# Mobile's own back button - the desktop app bar is `hidden md:flex`, so
+# small screens had no back option at all until now. Same rules as above,
+# just against the mobile topbar's own button id (ui/layouts/sidebar.py's
+# layout_mobile_topbar).
+clientside_callback(
+    ClientsideFunction(namespace='ui', function_name='toggleMobileBackButton'),
+    Output('mobile-back-btn', 'style'),
+    Input('url', 'pathname'),
+)
+clientside_callback(
+    ClientsideFunction(namespace='ui', function_name='mobileGoBack'),
+    Output('mobile-back-dummy', 'data'),
+    Input('mobile-back-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+
 # The Settings "Add Provider" dialogs (open/close/close-on-save) are wired
 # entirely in ui/callbacks/settings.py, as regular Python callbacks driven
 # by a dcc.Store - deliberately NOT clientside, and deliberately not mixed
@@ -80,6 +126,8 @@ import ui.callbacks.ui_extras
 import ui.callbacks.uploads
 
 if __name__ == '__main__':
+    DEBUG_MODE = True
+
     # Only the true server process ever reaches this guard - a spawned
     # background-job child process re-imports this whole module (see
     # AtelierRepository.initialize_db()'s docstring) but never satisfies
@@ -88,10 +136,27 @@ if __name__ == '__main__':
     # must NOT be called from module level / initialize_db() instead.
     AtelierRepository.reap_orphaned_sessions()
 
+    # Preload the SPLADE model once here (in a background thread - doesn't
+    # delay this process's own startup) and keep it warm for background
+    # jobs to reuse over a loopback socket instead of each paying its own
+    # ~20s cold load - see search/sparse_server.py's docstring for the full
+    # reasoning. Guarded to run in exactly ONE process: with DEBUG_MODE on,
+    # Werkzeug's dev-reloader re-executes this whole module twice - once in
+    # a watcher parent (which never serves real requests, and wouldn't set
+    # WERKZEUG_RUN_MAIN) and once in the actual serving child (which does) -
+    # starting the warm server in both would double-pay the cold load AND
+    # crash the second attempt trying to bind a port the first already
+    # holds. DEBUG_MODE off has no separate watcher process, so this
+    # process is unconditionally the one to start it.
+    if not DEBUG_MODE or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        from core.config import DEFAULT_SPARSE_MODEL
+        from search.sparse_server import start_warm_encoder_server
+        start_warm_encoder_server(DEFAULT_SPARSE_MODEL)
+
     # threaded=True matters here, not just for perf: Flask's dev server
     # otherwise handles one HTTP request at a time, so two browser tabs each
     # running a search serialize through that single worker - one tab's
     # background-callback polling/trigger requests visibly stall while the
     # other has the server's attention, making a concurrent search look
     # stuck rather than progressing.
-    app.run(debug=True, port=8050, threaded=True)
+    app.run(debug=DEBUG_MODE, port=8050, threaded=True)

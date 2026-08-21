@@ -1,5 +1,56 @@
 from dash import html, dcc
+from core.utils import truncate
+from database import AtelierRepository
 from llm import get_model_choices
+
+# Fallback quick-start prompts for a brand-new user with no history yet to
+# draw from - Atelier's equivalent of Stitch's own suggestion pills ("A
+# trip packing checklist app that sugge...", etc.), just scoped to what
+# THIS app actually does (literature synthesis, not app design). Once
+# there IS history, get_suggested_prompts below prefers that instead -
+# "it can start static but specialise," reported directly.
+_DEFAULT_SUGGESTED_PROMPTS = [
+    "Does metformin reduce cardiovascular risk in type 2 diabetics?",
+    "Summarize the evidence on urban green space and mental health",
+    "Write a literature review on microplastics in drinking water",
+]
+
+
+def get_suggested_prompts() -> list[str]:
+    """
+    Tailored to the user's own past research once there's any to draw
+    from - their most recent distinct session topics, so returning to
+    Home suggests picking up a thread they actually care about instead of
+    the same three generic examples forever. Falls back to
+    _DEFAULT_SUGGESTED_PROMPTS for a brand-new user with nothing yet.
+
+    Deliberately not an LLM call (e.g. "generate 3 NEW related questions
+    from this history") - Home has to stay fast to load, and a raw recent
+    topic is already a genuinely useful, zero-latency suggestion: clicking
+    it re-opens that same research thread, which is exactly what "continue
+    where I left off" means for a tool like this.
+
+    Called from BOTH layout_home (to render the chips) and
+    ui/callbacks/ui_extras.py's fill_suggestion_prompt (to resolve which
+    full prompt a click maps to) - kept as one shared function rather than
+    a value cached at render time, so the two agree without needing a
+    Store in between; the DB rarely changes in the few seconds between a
+    page rendering and a chip actually being clicked, and if it does, the
+    worst case is a chip's fill text quietly refers to a slightly
+    different topic instead of an error.
+    """
+    seen = set()
+    tailored = []
+    for s in AtelierRepository.get_all_sessions_for_history():
+        topic = (s.get('topic') or '').strip()
+        if not topic or topic in seen:
+            continue
+        seen.add(topic)
+        tailored.append(topic)
+        if len(tailored) == 3:
+            break
+    return tailored or _DEFAULT_SUGGESTED_PROMPTS
+
 
 def layout_home():
     """Route: '/' - The Initial Search Page (Hero Interface)"""
@@ -58,12 +109,35 @@ def layout_home():
                                 className="hidden sm:flex items-center bg-slate-100/80 border border-slate-200/50 rounded-xl ps-4 pe-2 py-2 cursor-pointer hover:bg-white transition-all group min-w-[160px]"
                             )
                         ]),
-                        html.Button(id="hero-search-btn", n_clicks=0, className="scholar-gradient text-white h-10 md:h-11 px-5 md:px-6 rounded-2xl flex items-center justify-center gap-2 hover:opacity-90 active:scale-95 transition-all shadow-xl shadow-primary/20 flex-shrink-0", children=[
-                            html.Span("Synthesize", className="font-bold text-xs md:text-sm tracking-widest uppercase"),
-                            html.Span("arrow_forward", className="material-symbols-outlined text-lg")
+                        # Icon-only, matching the feed's own follow-up
+                        # submit button (ui/layouts/feed.py's search-btn)
+                        # exactly - a text-labeled "SYNTHESIZE" button here
+                        # was the odd one out next to that, and Stitch's
+                        # own composer button is icon-only too. See
+                        # ui/callbacks/search.py's create_new_session for
+                        # the matching running=[...] spinner swap.
+                        html.Button(id="hero-search-btn", n_clicks=0, className="w-10 h-10 md:w-11 md:h-11 bg-primary hover:bg-primary/90 hover:scale-105 active:scale-95 rounded-2xl text-white shadow-xl shadow-primary/20 transition-all flex items-center justify-center flex-shrink-0", children=[
+                            html.Span("arrow_upward", id="hero-search-btn-icon", className="material-symbols-outlined text-xl md:text-2xl font-bold"),
                         ])
                     ])
                 ])
-            ])
+            ]),
+            # Quick-start pills, Stitch-style - see get_suggested_prompts
+            # above. A plain flex-wrap row (not a carousel like Stitch's
+            # "Need inspiration?" strip below the fold): three short
+            # prompts fit on one line at this width, so a horizontal-
+            # scroll rig would just be unused complexity for how little
+            # content there is here. Truncated for display (a real recent
+            # session topic can run to several sentences) - title carries
+            # the full text on hover, and clicking still fills in the FULL
+            # prompt (ui/callbacks/ui_extras.py's fill_suggestion_prompt
+            # re-resolves it by index, not from this truncated label).
+            html.Div(className="flex flex-wrap items-center justify-center gap-2 mt-4 px-4 animate-fade-in", style={"animationDelay": "0.3s"}, children=[
+                html.Button(
+                    truncate(prompt, 70), id={'type': 'suggestion-chip', 'index': i}, n_clicks=0, title=prompt,
+                    className="px-4 py-2 rounded-full border border-slate-200 bg-white text-slate-600 text-xs font-semibold hover:border-primary/30 hover:bg-primary/5 hover:text-primary transition-colors shadow-sm",
+                )
+                for i, prompt in enumerate(get_suggested_prompts())
+            ]),
         ])
     ])

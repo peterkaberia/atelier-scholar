@@ -59,6 +59,15 @@ class SessionModel(Base):
     id = Column(String, primary_key=True)
     topic = Column(Text, nullable=False)
     summary = Column(Text, nullable=True)
+    # The model the user had selected when this session was CREATED (Home's
+    # hero dropdown) - set once, at create_session time, before any turn has
+    # actually completed. QueryModel.model_used (set per-turn, once a turn
+    # finishes) is still the source of truth once it exists; this exists so
+    # a session that's still processing its very first turn - no QueryModel
+    # row yet - has SOMETHING to show for "which LLM is this" instead of a
+    # blank, on the feed page's own processing placeholder. See
+    # AtelierRepository.get_last_used_model, which now falls back to this.
+    model_used = Column(String, nullable=True)
     # Drives the sidebar/history status icons and lets the feed page tell a
     # still-running search apart from one that's actually done (or crashed)
     # when the user navigates back to it.

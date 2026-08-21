@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
     # callback - these Outputs apply the INSTANT the button is clicked
     # (before this function even starts running server-side), and revert
     # automatically once it returns. Without this, clicking "Synthesize"
-    # gave no feedback at all until the redirect to /history/<id> actually
+    # gave no feedback at all until the redirect to /session/<id> actually
     # landed and the feed page's own "Analyzing query intent..." skeleton
     # rendered - a real, if brief, dead-feeling gap between click and any
     # visible response. This function itself is fast (no I/O - see its own
@@ -43,15 +43,17 @@ logger = logging.getLogger(__name__)
         (Output('hero-search-btn', 'disabled'), True, False),
         (Output('hero-search-input', 'disabled'), True, False),
         (
-            Output('hero-search-btn', 'children'),
-            [
-                html.Span("Starting...", className="font-bold text-xs md:text-sm tracking-widest uppercase"),
-                html.Span("autorenew", className="material-symbols-outlined text-lg animate-spin"),
-            ],
-            [
-                html.Span("Synthesize", className="font-bold text-xs md:text-sm tracking-widest uppercase"),
-                html.Span("arrow_forward", className="material-symbols-outlined text-lg"),
-            ],
+            # Icon-only, matching the button's own default state
+            # (ui/layouts/home.py) - swaps the static up-arrow for a
+            # spinning "autorenew" glyph, nothing else.
+            Output('hero-search-btn-icon', 'children'),
+            "autorenew",
+            "arrow_upward",
+        ),
+        (
+            Output('hero-search-btn-icon', 'className'),
+            "material-symbols-outlined text-xl md:text-2xl font-bold animate-spin",
+            "material-symbols-outlined text-xl md:text-2xl font-bold",
         ),
     ],
     prevent_initial_call=True
@@ -77,7 +79,7 @@ def create_new_session(hero_clicks, hero_text, hero_llm, pending_uploads):
     mounts, which is how this worked previously) - store-pending-uploads
     only needs to be READ here, as a State, at the moment this callback
     already has it in hand; it never needs to carry the raw file bytes
-    across the redirect to /history/<id> via any browser storage
+    across the redirect to /session/<id> via any browser storage
     mechanism. That distinction matters: it used to, briefly, ride across
     that navigation in sessionStorage (see store-pending-uploads'
     docstring in ui/layouts/main.py's serve_layout), which has a hard
@@ -125,7 +127,7 @@ def create_new_session(hero_clicks, hero_text, hero_llm, pending_uploads):
     query = hero_text.strip() if has_text else ""
 
     if has_uploads and has_text:
-        AtelierRepository.create_session(new_session_id, query, "")
+        AtelierRepository.create_session(new_session_id, query, "", model_used=hero_llm)
         existing_flows = [build_loading_skeleton(query, "Analyzing query intent...")]
         router_payload = {
             "query": query, "llm": hero_llm, "session_id": new_session_id,
@@ -134,7 +136,7 @@ def create_new_session(hero_clicks, hero_text, hero_llm, pending_uploads):
         # url, clear clipboard (dispatching trigger-router directly
         # instead), clear topic/records/history stores, no trigger-upload,
         # clear staged uploads + their chip row, trigger router
-        return f"/history/{new_session_id}", None, "", [], [], no_update, [], [], router_payload
+        return f"/session/{new_session_id}", None, "", [], [], no_update, [], [], router_payload
 
     if has_uploads:
         # No text at all - fall back to a filename-derived label so the
@@ -142,7 +144,7 @@ def create_new_session(hero_clicks, hero_text, hero_llm, pending_uploads):
         # instead of an empty one.
         names = [f.get("filename", "file") for f in pending_uploads]
         topic = f"Attached: {', '.join(names)}"
-        AtelierRepository.create_session(new_session_id, topic, "")
+        AtelierRepository.create_session(new_session_id, topic, "", model_used=hero_llm)
 
         label = "Processing attached document(s)..."
         AtelierRepository.set_session_progress(new_session_id, label)
@@ -154,11 +156,11 @@ def create_new_session(hero_clicks, hero_text, hero_llm, pending_uploads):
         # url, clear clipboard, clear topic/records/history stores,
         # trigger upload, clear staged uploads + their chip row, no
         # trigger-router
-        return f"/history/{new_session_id}", None, "", [], [], upload_payload, [], [], no_update
+        return f"/session/{new_session_id}", None, "", [], [], upload_payload, [], [], no_update
 
-    AtelierRepository.create_session(new_session_id, query, "")
+    AtelierRepository.create_session(new_session_id, query, "", model_used=hero_llm)
     trigger_data = {"query": query, "llm": hero_llm, "session_id": new_session_id}
-    return f"/history/{new_session_id}", trigger_data, "", [], [], no_update, no_update, no_update, no_update
+    return f"/session/{new_session_id}", trigger_data, "", [], [], no_update, no_update, no_update, no_update
 
 @callback(
     Output('trigger-synthesis', 'data', allow_duplicate=True),
@@ -388,10 +390,10 @@ def generate_synth(synth_data):
         return {"session_id": session_id, "updates": {"flow_container": existing_flows}}
 
     existing_flows.pop()
-    existing_flows.append(html.Div(className="flow-block border-t border-slate-100", children=[
+    existing_flows.append(html.Div(id=f"turn-{new_query_id}", className="flow-block border-t border-slate-100", children=[
         build_flow_header(query, selected_llm, f"{len(processed_records)} References", query_id=new_query_id, synthesis_text=raw_md),
         build_atelier_meter(meter),
-        build_synthesis_body(raw_md, title="Abstract", valid_records=processed_records),
+        build_synthesis_body(raw_md, title="Abstract", valid_records=processed_records, query_id=new_query_id),
         build_paper_cards(processed_records, query_id=new_query_id, session_id=session_id)
     ]))
     return {"session_id": session_id, "updates": {"flow_container": existing_flows, "synthesis_markdown": raw_md}}

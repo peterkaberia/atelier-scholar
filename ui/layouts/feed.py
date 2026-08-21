@@ -3,13 +3,13 @@ import re
 from typing import Dict
 from dash import html, dcc
 from core.pdf_export import derive_document_title, strip_leading_title
-from core.utils import classify_study_type
+from core.utils import classify_study_type, truncate
 from database.repository import AtelierRepository
 from database.models import SessionModel
 from llm.utils import get_model_choices
 
 def layout_feed(session_id: str, pending_search: dict = None):
-    """Route: '/history/<id>' - The Follow-up Feed Interface"""
+    """Route: '/session/<id>' - The Follow-up Feed Interface"""
 
     # Resolved per render (not at import time) so a key saved via Settings
     # shows up in the dropdown without an app restart.
@@ -54,10 +54,13 @@ def layout_feed(session_id: str, pending_search: dict = None):
         chat_history = AtelierRepository.get_session_chat_history(session_id)
 
         for chat in chat_history:
-            historical_flows.append(html.Div(className="flow-block border-t border-slate-100", children=[
+            # id=f"turn-{query_id}" - the sidebar's per-session table of
+            # contents (ui/callbacks/ui_extras.py's _build_session_nav_items)
+            # links straight to this turn via a plain #fragment.
+            historical_flows.append(html.Div(id=f"turn-{chat.get('query_id')}", className="flow-block border-t border-slate-100", children=[
                 build_flow_header(chat.get('prompt'), chat.get('model_used'), f"{len(chat.get('citations', []))} References", query_id=chat.get('query_id'), synthesis_text=chat.get('synthesis')),
                 build_atelier_meter(chat.get('consensus_meter')),
-                build_synthesis_body(chat.get('synthesis'), valid_records=chat.get('citations', [])),
+                build_synthesis_body(chat.get('synthesis'), valid_records=chat.get('citations', []), query_id=chat.get('query_id')),
                 build_paper_cards(chat.get('citations', []), query_id=chat.get('query_id'), session_id=session_id)
             ]))
 
@@ -70,15 +73,20 @@ def layout_feed(session_id: str, pending_search: dict = None):
     still_processing = not historical_flows and status == SessionModel.STATUS_IN_PROGRESS
     if still_processing:
         topic = AtelierRepository.get_session_topic(session_id)
+        # get_last_used_model falls back to SessionModel.model_used (set at
+        # create_session time) when there's no completed turn yet to read
+        # it from - see that function's own docstring. Without this, a
+        # session still on its first turn showed no model at all here.
+        processing_model = AtelierRepository.get_last_used_model(session_id)
         # The real current stage, if one was ever recorded (see
         # AtelierRepository.set_session_progress) - falls back to the
         # generic "resuming" message only for a session that hasn't
         # reported any progress yet at all.
         progress_message = AtelierRepository.get_session_progress(session_id)
         historical_flows = [
-            build_loading_skeleton(topic or "Still working on this...", progress_message)
+            build_loading_skeleton(topic or "Still working on this...", progress_message, model_name=processing_model)
             if progress_message
-            else build_processing_placeholder(topic)
+            else build_processing_placeholder(topic, model_name=processing_model)
         ]
     elif not historical_flows and status == SessionModel.STATUS_FAILED:
         historical_flows = [build_failed_placeholder(AtelierRepository.get_session_topic(session_id), session_id)]
@@ -166,7 +174,7 @@ def layout_feed(session_id: str, pending_search: dict = None):
         ])
     ]
 
-def build_loading_skeleton(title: str, status_text: str, icon: str = "autorenew", spin: bool = True):
+def build_loading_skeleton(title: str, status_text: str, icon: str = "autorenew", spin: bool = True, model_name: str = ""):
     """
     A reusable 'flow-block' skeleton: title + spinning icon + one line of
     live status text. Shared by every in-progress state in the app - the
@@ -174,11 +182,45 @@ def build_loading_skeleton(title: str, status_text: str, icon: str = "autorenew"
     resumed-in-progress placeholder below, and the router's intent-scanning
     skeletons (ui/callbacks/chat.py) - so a single visual language covers
     "something is happening" everywhere instead of one-off inline markup.
+
+    title is truncated to a short header here (not just displayed
+    verbatim) - a long "write me a report" prompt used to render as the
+    FULL raw prompt on this H1, same bug build_flow_header had before it
+    started using derive_document_title (see that function's docstring).
+    There's no finished answer yet to pull a real heading from at this
+    point, so this can't do what build_flow_header does - it just
+    truncates, same fallback derive_document_title itself uses when an
+    answer has no heading of its own. When truncation actually changed
+    anything, the full original text is kept visible right below in the
+    same small "Original request" box build_flow_header uses, so nothing
+    is hidden, just de-emphasized - reported directly: a session's header
+    should be usable "immediately," not just once the answer is done.
+
+    model_name (optional): shown as a small meta line under the title,
+    same treatment build_flow_header gives a finished turn - so a session
+    still on its very first turn shows which model is working on it
+    instead of nothing at all.
     """
+    display_title = truncate(title or "", 100)
+    prompt_box = None
+    if display_title.strip() != (title or "").strip():
+        prompt_box = html.Div(className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3", children=[
+            html.Span("Original request", className="block text-[9px] font-extrabold text-primary uppercase tracking-widest mb-1"),
+            html.P(title, className="text-xs text-slate-500 leading-relaxed whitespace-pre-wrap m-0"),
+        ])
+    model_row = None
+    if model_name:
+        model_row = html.Div(className="flex items-center space-x-2 mt-3", children=[
+            html.Span("precision_manufacturing", className="material-symbols-outlined text-primary text-lg"),
+            html.Span(model_name, className="text-[11px] font-extrabold text-slate-500 uppercase tracking-widest"),
+        ])
+
     return html.Div(className="flow-block border-t border-slate-100", children=[
         html.Section(className="py-12 px-4 md:px-12", children=[
             html.Div(className="max-w-3xl mx-auto", children=[
-                html.H1(title, className="text-3xl font-extrabold text-slate-900 tracking-tight"),
+                html.H1(display_title, title=title, className="text-3xl font-extrabold text-slate-900 tracking-tight"),
+                prompt_box,
+                model_row,
             ])
         ]),
         html.Section(className="py-12 px-4 md:px-12 bg-[#F8FAFF]", children=[
@@ -190,12 +232,13 @@ def build_loading_skeleton(title: str, status_text: str, icon: str = "autorenew"
     ])
 
 
-def build_processing_placeholder(topic: str = ""):
+def build_processing_placeholder(topic: str = "", model_name: str = ""):
     """Shown when the feed page loads with no completed turns yet, but the session's search is still genuinely running server-side (background=True keeps it alive across navigation)."""
     return build_loading_skeleton(
         topic or "Still working on this...",
         "Resuming — this search is still running in the background. This page will update automatically.",
         icon="autorenew",
+        model_name=model_name,
     )
 
 
@@ -386,8 +429,19 @@ def build_atelier_meter(meter_data: dict):
     ])
 
 
-def build_synthesis_body(raw_markdown: str, title: str = "Synthesis Summary", valid_records: list = None):
+def build_synthesis_body(raw_markdown: str, title: str = "Synthesis Summary", valid_records: list = None, query_id=None):
     """
+    query_id (optional): stamped as a data-query-id attribute on the
+    rendered body so a clientside script (ui/layouts/main.py's
+    assignHeadingIds) can give each of THIS turn's own H2 section headings
+    a stable id ("turn-{query_id}-h-{i}") - what the sidebar's per-session
+    table of contents (ui/callbacks/ui_extras.py's _build_session_nav_items)
+    links to. Index-based, not a text slug, and assigned client-side (dcc.
+    Markdown doesn't emit heading ids itself, confirmed directly) rather
+    than baked into the markdown string - both sides just walk H2s in the
+    same top-to-bottom document order, so they agree without needing to
+    match on anything fuzzier than position.
+
     Strips the answer's own leading heading (via strip_leading_title)
     before rendering - build_flow_header, right above this in the page,
     already displays that exact same heading as the page's H1 title (see
@@ -446,7 +500,7 @@ def build_synthesis_body(raw_markdown: str, title: str = "Synthesis Summary", va
                 html.Div(
                     dcc.Markdown(escaped_markdown),
                     className="prose max-w-none synthesis-citations",
-                    **{"data-citations": citations_payload},
+                    **{"data-citations": citations_payload, "data-query-id": str(query_id) if query_id is not None else ""},
                 ),
             ])
         ])

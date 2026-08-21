@@ -529,9 +529,9 @@ def run_chat(chat_data, chat_history):
         # flow-block's Results section except the newest one by default
         # (results-accordion-body), so repeating it per turn no longer
         # means repeating it VISIBLY per turn either.
-        new_flow = html.Div(className="flow-block border-t border-slate-100", children=[
+        new_flow = html.Div(id=f"turn-{new_query_id}", className="flow-block border-t border-slate-100", children=[
             build_flow_header(query, selected_llm, f"{len(processed_records)} Context Papers", query_id=new_query_id, synthesis_text=ai_response),
-            build_synthesis_body(ai_response, valid_records=processed_records),
+            build_synthesis_body(ai_response, valid_records=processed_records, query_id=new_query_id),
             build_paper_cards(processed_records, query_id=new_query_id, session_id=session_id),
         ])
 
@@ -698,9 +698,9 @@ def run_investigation(set_progress, investigate_data, chat_history):
         # identical addition above - see its comment. Historical
         # reconstruction (layout_feed) already rendered this on reload;
         # this was the gap that made it look reload-only live.
-        new_flow = html.Div(className="flow-block border-t border-slate-100", children=[
+        new_flow = html.Div(id=f"turn-{new_query_id}", className="flow-block border-t border-slate-100", children=[
             build_flow_header(query, selected_llm, ref_label, query_id=new_query_id, synthesis_text=answer_text),
-            build_synthesis_body(answer_text, title="Investigation", valid_records=valid_records),
+            build_synthesis_body(answer_text, title="Investigation", valid_records=valid_records, query_id=new_query_id),
             build_paper_cards(valid_records, query_id=new_query_id, session_id=session_id),
         ])
         # Remove route_intent's "Investigating your question..." skeleton

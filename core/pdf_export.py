@@ -217,6 +217,27 @@ def derive_document_title(markdown_text: str, fallback: str) -> str:
     return heading or truncate(fallback or "Atelier Report", 100)
 
 
+_H2_HEADING_RE = re.compile(r"^\s*##\s+(.+?)\s*$", re.MULTILINE)
+
+
+def extract_section_headings(markdown_text: str) -> List[str]:
+    """
+    Every top-level ("##") section heading in a turn's answer, in
+    document order - e.g. ["1. Introduction", "2. Hydrological Setting...",
+    ...] for a structured report. Used by ui/callbacks/ui_extras.py's
+    sidebar table-of-contents (_build_session_nav_items) to link straight
+    to a section, matching ids a clientside script assigns to the SAME
+    headings at render time (ui/layouts/main.py's assignHeadingIds) purely
+    by position (turn-{query_id}-h-{i}) - both sides just walk "##" lines/
+    <h2> elements top-to-bottom, so they agree without needing to match on
+    heading text itself. Deliberately "##" only, not "###" too - a session
+    nav panel listing every subsection of every turn would get unusably
+    long and deep for a ~320px sidebar; the top-level sections are the
+    useful jump targets.
+    """
+    return [m.group(1).strip() for m in _H2_HEADING_RE.finditer(markdown_text or "")]
+
+
 def strip_leading_title(markdown_text: str) -> str:
     """
     Returns markdown_text with its leading heading line removed, if it had
